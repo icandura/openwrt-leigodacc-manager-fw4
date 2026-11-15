@@ -477,16 +477,33 @@ function get_debug_status()
   resp.process.pid = pid_parts[1] or "N/A"
   resp.process.vsz_kb = pid_parts[2] or "N/A"
 
-  -- Port listening check: try ss first, fallback to netstat (BusyBox lacks ss)
-  local port_out = util.exec("ss -tlnp 2>/dev/null | grep 5588") or ""
-  if port_out == "" then
-    port_out = util.exec("netstat -tlnp 2>/dev/null | grep 5588") or ""
+  -- Port listening check: parse /proc/net/tcp directly.
+  -- iStoreOS 25.12 has no `ss` binary and netstat may be absent as well;
+  -- /proc/net/tcp prints the port in hex (5588 -> 0x15D4), state 0A = LISTEN.
+  local function port_listen(port)
+    local hex = string.format("%04X", port)
+    local f, line
+    for _, path in ipairs({ "/proc/net/tcp", "/proc/net/tcp6" }) do
+      f = io.open(path, "r")
+      if f then
+        for line in f:lines() do
+          local addr, st = line:match("^%s*%d+:%s*(%S+)%s+%S+%s+(%S+)")
+          if st == "0A" and addr and #addr >= #hex and addr:sub(-#hex) == hex then
+            f:close()
+            return true
+          end
+        end
+        f:close()
+      end
+    end
+    return false
   end
-  resp.process.port_listening = port_out ~= ""
+  resp.process.port_listening = port_listen(5588)
 
-  -- Init script enabled
-  local init_enabled = util.exec("/etc/init.d/acc enabled 2>/dev/null") or ""
-  resp.process.init_enabled = init_enabled:match("running") ~= nil or init_enabled:match("enabled") ~= nil
+  -- Init script enabled: procd's `enabled` prints nothing, only sets an exit
+  -- code, so a text match can never work (and always reported "No").
+  local init_rc = os.execute("/etc/init.d/acc enabled >/dev/null 2>&1")
+  resp.process.init_enabled = (init_rc == 0)
 
   -- === Init Script Analysis ===
   resp.init_script.exists = fs.access("/etc/init.d/acc")
@@ -505,9 +522,13 @@ function get_debug_status()
     local short_tpr  = args_line:match("%-m tproxy")
     local long_tun   = args_line:match("%-%mode tun")
     local long_tpr   = args_line:match("%-%mode tproxy")
+    -- 25.12 init script uses a template: args="-r daemon -m ${mode} -p 5588"
+    -- (${mode} is filled in from acc_firewall.ini at start time)
+    local tpl_mode   = args_line:find("-m ${mode}", 1, true) ~= nil
 
-    resp.init_script.short_format = (short_tun ~= nil or short_tpr ~= nil)
+    resp.init_script.short_format = (short_tun ~= nil or short_tpr ~= nil or tpl_mode)
     resp.init_script.has_long_format = (long_tun ~= nil or long_tpr ~= nil)
+    resp.init_script.template_mode = tpl_mode
 
     if short_tun then
       resp.init_script.mode_flag = "-m tun"
@@ -515,6 +536,9 @@ function get_debug_status()
     elseif short_tpr then
       resp.init_script.mode_flag = "-m tproxy"
       resp.init_script.mode_name = "TPROXY"
+    elseif tpl_mode then
+      resp.init_script.mode_flag = "-m ${mode}"
+      resp.init_script.mode_name = "由 acc_firewall.ini 的 mode 决定"
     elseif long_tun then
       resp.init_script.mode_flag = "--mode tun"
       resp.init_script.mode_name = "TUN (LONG FORMAT)"
@@ -548,7 +572,18 @@ function get_debug_status()
     local tproxy = conf_raw:match('"tproxy_ip":"([^"]*)"')
     resp.core_config.tproxy_ip = tproxy or "not found"
     local lan_ip = uci:get("network", "lan", "ipaddr") or ""
-    resp.core_config.tproxy_ip_ok = (tproxy == lan_ip)
+    -- New layout: acc_firewall.ini carries the authoritative TPROXY target
+    -- (a per-backend sentinel, NOT the LAN IP). Legacy: LAN IP.
+    local expect = lan_ip
+    local ini_present = fs.access("/etc/config/acc_firewall.ini")
+    if ini_present then
+      for line in io.lines("/etc/config/acc_firewall.ini") do
+        local v = line:match("^tproxy_ip=(.*)$")
+        if v then expect = v end
+      end
+    end
+    resp.core_config.expected_tproxy_ip = expect
+    resp.core_config.tproxy_ip_ok = (tproxy == expect)
     local acc_mode = conf_raw:match('"acc_mode":(%d+)')
     resp.core_config.acc_mode = acc_mode or "not found"
     if acc_mode == "1" then
@@ -594,6 +629,54 @@ function get_debug_status()
   else
     resp.network.gameacc_exists = false
     resp.network.gameacc_sample = "N/A"
+  end
+
+  -- === TPROXY policy routing ===
+  -- The engine marks intercepted packets with 0x99 and relies on
+  --   ip rule add fwmark 0x99 pref 99 lookup 99
+  --   ip route add local default dev lo table 99
+  -- to deliver them to the local proxy.  When either is missing the packets
+  -- are still marked by GAMEACC but fall through to the default route, which
+  -- looks exactly like "APP says accelerating but traffic is not proxied".
+  local rule_out = util.exec("ip rule show 2>/dev/null") or ""
+  resp.network.tproxy_rule = rule_out:find("fwmark 0x99", 1, true) ~= nil
+  local rt_out = util.exec("ip route show table 99 2>/dev/null") or ""
+  resp.network.tproxy_route = rt_out:find("local default dev lo", 1, true) ~= nil
+
+  -- Engine rule-injection failures (its own log wording)
+  local inject_fail = util.exec(
+    "grep -l -E 'add ip route failed|add ip routes failed|create tproxy common rules failed|create acc tproxy rules failed' /tmp/acc/log/*.log 2>/dev/null | head -1") or ""
+  resp.network.tproxy_inject_failed = inject_fail ~= ""
+
+  -- === Acceleration tunnel health ===
+  -- The engine keeps a heartbeat to each relay server it may use; a missing
+  -- heartbeat means the tunnel is not up and nothing will be accelerated.
+  resp.tunnel = { servers = {}, ok = false, data_plane = false }
+  local tlog = "/tmp/acc/log/acc_Game.log"
+  if not fs.access(tlog) then tlog = "/tmp/acc/log/acc_acc.log" end
+  if fs.access(tlog) then
+    resp.tunnel.log = tlog
+    local out = util.exec("grep -a 'TunnelHeartBeat' " .. tlog .. " 2>/dev/null | tail -60") or ""
+    local seen = {}
+    for line in out:gmatch("[^\n]+") do
+      local ip, port, loss, avg = line:match(
+        "server%\([^)]*%\):([%d%.]+):(%d+).-lost_persent:(%d+)%-*.-average_delay:(%d+)")
+      if not avg then
+        ip, port, loss = line:match("server%\([^)]*%\):([%d%.]+):(%d+).-lost_persent:(%d+)")
+      end
+      local addr = ip and (ip .. ":" .. port) or nil
+      if addr and not seen[addr] then
+        seen[addr] = true
+        resp.tunnel.servers[#resp.tunnel.servers + 1] = {
+          addr = addr,
+          loss = tonumber(loss) or 0,
+          delay = tonumber(avg) or 0
+        }
+      end
+    end
+    resp.tunnel.ok = #resp.tunnel.servers > 0
+    local s5 = util.exec("grep -ac 'S5 UDP' " .. tlog .. " 2>/dev/null") or "0"
+    resp.tunnel.data_plane = (tonumber(s5:match("%d+")) or 0) > 0
   end
 
   -- === Latency Diagnostics ===
@@ -656,13 +739,28 @@ function get_debug_status()
     ["kmod-tun"]        = "kmod-tun",
     ["tc-full"]         = "tc-full",
     ["conntrack"]       = "conntrack",
-    ["libpcap"]         = "libpcap",
-    ["luci-compat"]     = "luci-compat"
+    ["libpcap1"]        = "libpcap1",
+    ["luci-compat"]     = "luci-compat",
+    ["luci-lua-runtime"] = "luci-lua-runtime"
   }
   resp.packages = {}
+  -- Package names differ between opkg (<=24.10) and apk (>=25.12);
+  -- probe both so the diagnostics page works on either backend.
+  local function pkg_installed_lua(pkg)
+    local alt = pkg
+    if pkg == "libpcap1" then alt = "libpcap" end
+    for _, cand in ipairs({ pkg, alt }) do
+      if util.exec("apk info -e '" .. cand .. "' >/dev/null 2>&1 && echo yes || echo no"):match("yes") then
+        return true
+      end
+      if util.exec("opkg list-installed 2>/dev/null | grep -q '^" .. cand .. " ' && echo yes || echo no"):match("yes") then
+        return true
+      end
+    end
+    return false
+  end
   for name, pkg in pairs(pkg_check) do
-    local installed = util.exec("opkg list-installed 2>/dev/null | grep -q '^" .. pkg .. " ' && echo yes || echo no")
-    resp.packages[name] = installed:match("yes") ~= nil
+    resp.packages[name] = pkg_installed_lua(pkg)
   end
 
   -- === Devices ===
@@ -741,7 +839,9 @@ function get_debug_status()
     for _, lf in ipairs(log_files) do
       local path = log_dir .. lf
       if fs.access(path) then
-        local content = util.exec("grep -iE 'error|fail|fatal|crash|wrong|invalid|exit|refused' " .. path .. " 2>/dev/null | tail -5") or ""
+        -- Only real ERROR/WARN lines: "child process exit ... INFO" is routine
+        local content = util.exec("tail -n 200 " .. path ..
+          " 2>/dev/null | grep -E ' (ERROR|WARN|FATAL) ' | grep -v -E 'acc_objs is empty|delete iptables rule failed|delete rule failed|unknow acc mode|acceleration is empty|log report switch failed|router_log_report_config' | tail -5") or ""
         if content ~= "" and content ~= "\n" then
           for line in content:gmatch("[^\n]+") do
             resp.error_logs[#resp.error_logs + 1] = { file = lf, line = line }
@@ -749,6 +849,33 @@ function get_debug_status()
         end
       end
     end
+  end
+
+  -- === Web child crash loop ===
+  -- New engines fork `-r web` and, when it cannot start (e.g. it fails to pull
+  -- the global config from opapi.xxghh.biz), it exits and is reforked ~5s.
+  -- acc_daemon.log then repeats "child process exit, ... status:0".
+  local loop_n = util.exec("tail -60 /tmp/acc/log/acc_daemon.log 2>/dev/null | grep -c 'child process exit'") or "0"
+  resp.web_loop_count = tonumber(loop_n:match("%d+")) or 0
+
+  -- === acc_firewall.ini (authoritative on 25.12 builds) ===
+  resp.firewall_ini = { exists = fs.access("/etc/config/acc_firewall.ini") }
+  if resp.firewall_ini.exists then
+    for line in io.lines("/etc/config/acc_firewall.ini") do
+      local k, v = line:match("^([%w_]+)=(.*)$")
+      if k == "backend" then
+        resp.firewall_ini.backend = v
+      elseif k == "mode" then
+        resp.firewall_ini.mode = v
+      elseif k == "tproxy_ip" then
+        resp.firewall_ini.tproxy_ip = v
+      end
+    end
+    -- Vendor sentinel per backend (see lib/setup.sh get_tproxy_ip_by_backend)
+    local want = "10.20.30.40"
+    if resp.firewall_ini.backend == "nftables" then want = "0.0.0.0" end
+    resp.firewall_ini.expected_tproxy_ip = want
+    resp.firewall_ini.tproxy_sentinel_ok = (resp.firewall_ini.tproxy_ip == want)
   end
 
   -- ============================================================
@@ -772,7 +899,8 @@ function get_debug_status()
   end
 
   -- Mode consistency: is the process actually running in the mode the init script specifies?
-  if resp.process.running and resp.init_script.short_format then
+  if resp.process.running and resp.init_script.short_format
+     and not resp.init_script.template_mode then
     local init_mode = resp.init_script.mode_flag:match("%-m (%S+)")
     if init_mode and pid_mode and init_mode ~= pid_mode then
       issue("warning", "Mode mismatch: init script specifies " .. init_mode .. " but process is running as " .. pid_mode .. ". Try restarting the service (menu option 5).")
@@ -898,14 +1026,14 @@ function get_debug_status()
   -- Core config: tproxy_ip correctness
   if resp.core_config.exists then
     if resp.core_config.tproxy_ip_ok then
-      check("acc_core_conf.json tproxy_ip matches LAN IP", true)
+      check("acc_core_conf.json tproxy_ip matches configured target", true)
     else
       if pid_mode == "tproxy" then
-        issue("error", "acc_core_conf.json tproxy_ip (" .. resp.core_config.tproxy_ip .. ") does NOT match LAN IP (" .. resp.system.lan_ip .. "). The web subprocess will CRASH (exit 255) and phone APP cannot communicate. Run 'leigod-fw4.sh fix-config' to auto-fix.")
-        check("acc_core_conf.json tproxy_ip matches LAN IP", false, "error")
+        issue("error", "acc_core_conf.json tproxy_ip (" .. tostring(resp.core_config.tproxy_ip) .. ") does not match the configured target (" .. tostring(resp.core_config.expected_tproxy_ip) .. "). The web subprocess may crash-loop and the phone APP cannot communicate. Run 'leigod-fw4.sh fix-tproxy' to align it.")
+        check("acc_core_conf.json tproxy_ip matches configured target", false, "error")
       else
-        issue("warning", "acc_core_conf.json tproxy_ip (" .. resp.core_config.tproxy_ip .. ") does not match LAN IP (" .. resp.system.lan_ip .. "). In TUN mode this may not matter, but if you switch to TPROXY it will break.")
-        check("acc_core_conf.json tproxy_ip matches LAN IP", false, "warning")
+        issue("warning", "acc_core_conf.json tproxy_ip (" .. tostring(resp.core_config.tproxy_ip) .. ") does not match the configured target (" .. tostring(resp.core_config.expected_tproxy_ip) .. ").")
+        check("acc_core_conf.json tproxy_ip matches configured target", false, "warning")
       end
     end
 
@@ -936,6 +1064,70 @@ function get_debug_status()
     check("Leigod API webapi.leigod.com is reachable", false, "error")
   end
 
+  -- CDN resolution + routing table (why "tunnel up but nothing accelerated")
+  if resp.process.running and pid_mode == "tproxy" then
+    if resp.cdn.dfs_resolvable then
+      check("引擎 CDN 域名本机可解析 (dfs01.nn.com)", true)
+    else
+      issue("error", "本机无法解析 dfs01.nn.com：引擎下载不到分流表 (cidrs.txt / cidrs_direct.txt / mac.json)，隧道会空转、游戏不会被加速。处理: 管理器菜单 D 写入 DNS 兜底，然后 /etc/init.d/acc restart。")
+      check("引擎 CDN 域名本机可解析 (dfs01.nn.com)", false, "error")
+    end
+
+    if resp.cdn.direct_cidrs > 0 then
+      check("分流表已加载 (direct_Game 有 " .. resp.cdn.direct_cidrs .. " 条)", true)
+    else
+      issue("warning", "direct_Game 集合为空：引擎尚未加载直连网段。若刚点加速请稍等再看；持续为空说明分流表没有下载成功（见上一条）。")
+      check("分流表已加载 (direct_Game 非空)", false, "warning")
+    end
+  end
+
+  -- Tunnel heartbeat: without it nothing is accelerated at all
+  if resp.process.running and pid_mode == "tproxy" then
+    if resp.tunnel and resp.tunnel.ok then
+      local best, best_delay = nil, nil
+      for _, s in ipairs(resp.tunnel.servers) do
+        if s.delay and (not best_delay or s.delay < best_delay) then
+          best, best_delay = s, s.delay
+        end
+      end
+      check("加速隧道心跳正常 (" .. (best and best.addr or "?") .. " / " ..
+            tostring(best_delay or "?") .. "ms)", true)
+    else
+      issue("warning", "未检测到加速隧道心跳 (acc_Game.log 内无 TunnelHeartBeat)。隧道未建立时流量不会被转发，请查看该日志。")
+      check("加速隧道心跳正常", false, "warning")
+    end
+  end
+
+  -- === Engine CDN resolution / routing-table availability ===
+  -- The engine downloads its routing data from dfs01.nn.com
+  -- (mac.json, cidrs.txt, cidrs_direct.txt). When the local resolver returns
+  -- only a CNAME (seen with dnsmasq behind MosDNS), every download fails with
+  -- "HTTP Status: 0", the tunnel carries only heartbeats and games are never
+  -- accelerated. Menu D (dns guard) pins IPv4 into /etc/hosts.
+  resp.cdn = { dfs_resolvable = false, direct_cidrs = 0 }
+  local cdn_ip = util.exec(
+    "nslookup dfs01.nn.com 2>/dev/null | awk '/^Address: *[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$/ {print $2; exit}'") or ""
+  resp.cdn.dfs_resolvable = (cdn_ip:match("^%d+%.%d+%.%d+%.%d+$") ~= nil)
+  local dg = util.exec("ipset list direct_Game 2>/dev/null | grep -c '^[0-9]'") or "0"
+  resp.cdn.direct_cidrs = tonumber(dg:match("%d+")) or 0
+
+  -- TPROXY policy routing (new engine: fwmark 0x99 -> table 99 -> local)
+  if resp.process.running and pid_mode == "tproxy" then
+    if resp.network.tproxy_inject_failed then
+      issue("error", "引擎报告加速规则注入失败 (日志含 'add ip routes failed' 或 'create tproxy rules failed')。表现为 APP 显示加速中但游戏流量未被代理。常见原因: ip 命令不可用/策略路由被其他代理插件覆盖/权限不足。")
+      check("加速规则注入成功", false, "error")
+    else
+      check("加速规则注入成功", true)
+    end
+
+    if resp.network.tproxy_rule and resp.network.tproxy_route then
+      check("TPROXY 策略路由 (fwmark 0x99 / table 99)", true)
+    else
+      issue("error", "TPROXY 策略路由缺失: ip rule 中没有 'fwmark 0x99' 或 table 99 中没有 'local default dev lo'。此时数据包会被标记却不会交付给代理进程 → 加速看起来成功但出口 IP 不变。")
+      check("TPROXY 策略路由 (fwmark 0x99 / table 99)", false, "error")
+    end
+  end
+
   -- GAMEACC chain
   if resp.network.gameacc_exists then
     check("GAMEACC iptables chain exists", true)
@@ -958,9 +1150,29 @@ function get_debug_status()
     check("acc-gw internal logs are error-free", true)
   end
 
-  -- Web subprocess crash detection (exit 255 pattern)
-  if resp.core_config.exists and pid_mode == "tproxy" and not resp.core_config.tproxy_ip_ok then
-    issue("error", "Web subprocess crash loop expected: tproxy_ip mismatch. The web process exits with code 255 every ~8 seconds, consuming CPU and preventing phone APP communication. FIX: set tproxy_ip to " .. resp.system.lan_ip .. " in /tmp/acc/acc_core_conf.json and restart.")
+  -- Web child crash loop (new engine refork every ~5s, exit status 0)
+  if (resp.web_loop_count or 0) >= 3 then
+    issue("error", "检测到 web 子进程崩溃循环: 最近 60 行 acc_daemon.log 出现 " .. resp.web_loop_count .. " 次 'child process exit'。API 端口 5588 不会就绪，手机 APP 无法通信。请查看 /tmp/acc/log/web_api.log 中 start_web 的报错（常见: start global config manager failed = 拉取雷神全局配置失败）。")
+    check("web 子进程稳定 (未反复退出)", false, "error")
+  else
+    check("web 子进程稳定 (未反复退出)", true, "info")
+  end
+
+  -- acc_firewall.ini sanity (new layout only)
+  if resp.firewall_ini and resp.firewall_ini.exists then
+    if resp.firewall_ini.tproxy_sentinel_ok then
+      check("acc_firewall.ini tproxy_ip 符合 " .. tostring(resp.firewall_ini.backend) .. " 后端标准值", true)
+    else
+      issue("warning", "acc_firewall.ini tproxy_ip=" .. tostring(resp.firewall_ini.tproxy_ip) .. "，该后端标准值为 " .. tostring(resp.firewall_ini.expected_tproxy_ip) .. "。执行 leigod-fw4.sh fix-tproxy 可自动校正。")
+      check("acc_firewall.ini tproxy_ip 符合后端标准值", false, "warning")
+    end
+  end
+
+  -- Legacy only: tproxy_ip != LAN IP causes an exit-255 crash loop
+  if not (resp.firewall_ini and resp.firewall_ini.exists)
+     and resp.core_config.exists and pid_mode == "tproxy"
+     and not resp.core_config.tproxy_ip_ok then
+    issue("error", "旧版引擎: tproxy_ip 与 LAN IP 不一致会让 web 子进程以 255 退出。运行 leigod-fw4.sh fix-tproxy 修复。")
   end
 
   luci.http.prepare_content("application/json")
@@ -1010,8 +1222,26 @@ function get_debug_report()
     local pid = ps_raw:match("^(%d+)") or "N/A"
     w("  PID:         " .. pid)
   end
-  local ss = util.exec("ss -tlnp 2>/dev/null | grep 5588") or ""
-  w("  Port 5588:   " .. yn(ss ~= ""))
+  -- Port 5588 via /proc/net/tcp (no `ss` on iStoreOS 25.12)
+  local function port_listen_rep(port)
+    local hex = string.format("%04X", port)
+    local f, line
+    for _, p in ipairs({ "/proc/net/tcp", "/proc/net/tcp6" }) do
+      f = io.open(p, "r")
+      if f then
+        for line in f:lines() do
+          local addr, st = line:match("^%s*%d+:%s*(%S+)%s+%S+%s+(%S+)")
+          if st == "0A" and addr and #addr >= #hex and addr:sub(-#hex) == hex then
+            f:close()
+            return true
+          end
+        end
+        f:close()
+      end
+    end
+    return false
+  end
+  w("  Port 5588:   " .. yn(port_listen_rep(5588)))
 
   -- Init script
   local init_exists = fs.access("/etc/init.d/acc")
@@ -1025,6 +1255,7 @@ function get_debug_report()
     end
     w("  Args:        " .. args_line)
     local has_short = args_line:match("%-m tun") or args_line:match("%-m tproxy")
+                    or args_line:find("-m ${mode}", 1, true)
     w("  Short fmt:   " .. yn(has_short ~= nil))
     local has_port = args_line:match("%-p %d+")
     w("  Has port:    " .. yn(has_port ~= nil))
@@ -1040,7 +1271,19 @@ function get_debug_report()
     for line in io.lines("/tmp/acc/acc_core_conf.json") do conf_raw = conf_raw .. line end
     local tproxy_ip = conf_raw:match('"tproxy_ip":"([^"]*)"') or "not found"
     local lan_ip = uci:get("network","lan","ipaddr") or ""
-    w("  tproxy_ip:   " .. tproxy_ip .. " (LAN: " .. lan_ip .. ") [" .. ok(tproxy_ip == lan_ip) .. "]")
+    -- New layout: the INI sentinel is authoritative; legacy: LAN IP
+    local ini_ip = ""
+    if fs.access("/etc/config/acc_firewall.ini") then
+      for line in io.lines("/etc/config/acc_firewall.ini") do
+        local v = line:match("^tproxy_ip=(.*)$")
+        if v then ini_ip = v end
+      end
+    end
+    if ini_ip ~= "" then
+      w("  tproxy_ip:   " .. tproxy_ip .. " (INI: " .. ini_ip .. ") [" .. ok(tproxy_ip == ini_ip) .. "]")
+    else
+      w("  tproxy_ip:   " .. tproxy_ip .. " (LAN: " .. lan_ip .. ") [" .. ok(tproxy_ip == lan_ip) .. "]")
+    end
     local acc_mode = conf_raw:match('"acc_mode":(%d+)') or "not found"
     local mode_name = acc_mode == "1" and "TUN" or (acc_mode == "2" and "TPROXY" or "UNKNOWN")
     w("  acc_mode:    " .. mode_name .. " (" .. acc_mode .. ")")
@@ -1066,9 +1309,21 @@ function get_debug_report()
   -- Packages
   w("")
   w("--- Critical Packages ---")
-  for _, pkg in ipairs({"iptables-nft","kmod-nft-nat","kmod-nft-tproxy","kmod-tun","tc-full","conntrack","libpcap","luci-compat"}) do
-    local inst = util.exec("opkg list-installed 2>/dev/null | grep -q '^" .. pkg .. " ' && echo yes || echo no"):match("yes") ~= nil
-    w("  " .. pkg .. ": " .. string.rep(" ", 18 - #pkg) .. yn(inst))
+  local function pkg_ok_lua(pkg)
+    local alt = (pkg == "libpcap") and "libpcap1" or ((pkg == "libpcap1") and "libpcap" or pkg)
+    for _, cand in ipairs({ pkg, alt }) do
+      if util.exec("apk info -e '" .. cand .. "' >/dev/null 2>&1 && echo yes || echo no"):match("yes") then
+        return true
+      end
+      if util.exec("opkg list-installed 2>/dev/null | grep -q '^" .. cand .. " ' && echo yes || echo no"):match("yes") then
+        return true
+      end
+    end
+    return false
+  end
+  for _, pkg in ipairs({"iptables-nft","kmod-nft-nat","kmod-nft-tproxy","kmod-tun","tc-full","conntrack","libpcap1","luci-compat","luci-lua-runtime"}) do
+    local inst = pkg_ok_lua(pkg)
+    w("  " .. pkg .. ": " .. string.rep(" ", 20 - #pkg) .. yn(inst))
   end
 
   -- Devices
@@ -1119,7 +1374,9 @@ function get_debug_report()
     for _, lf in ipairs({"acc_daemon.log","acc_web.log","acc_acc.log"}) do
       local path = log_dir .. lf
       if fs.access(path) then
-        local content = util.exec("grep -iE 'error|fail|fatal|crash|wrong|invalid|exit|refused' " .. path .. " 2>/dev/null | tail -5") or ""
+        -- Only real ERROR/WARN lines: "child process exit ... INFO" is routine
+        local content = util.exec("tail -n 200 " .. path ..
+          " 2>/dev/null | grep -E ' (ERROR|WARN|FATAL) ' | grep -v -E 'acc_objs is empty|delete iptables rule failed|delete rule failed|unknow acc mode|acceleration is empty|log report switch failed|router_log_report_config' | tail -5") or ""
         if content ~= "" and content ~= "\n" then
           found_errors = true
           w("  [" .. lf .. "]")

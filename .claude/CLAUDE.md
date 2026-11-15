@@ -1,6 +1,6 @@
 # Leigod FW4 — OpenWrt 雷神加速器管理器
 
-OpenWrt 24.10+ fw4/nftables 适配的 LeigodAcc 管理脚本。基于 [miaoermua/openwrt-leigodacc-manager](https://github.com/miaoermua/openwrt-leigodacc-manager) 改造。
+iStoreOS 25.12（OpenWrt 25.12 / apk）fw4/nftables 适配的 LeigodAcc 管理脚本。基于 [miaoermua/openwrt-leigodacc-manager](https://github.com/miaoermua/openwrt-leigodacc-manager) 改造。
 
 ## 项目文件索引
 
@@ -15,7 +15,7 @@ OpenWrt 24.10+ fw4/nftables 适配的 LeigodAcc 管理脚本。基于 [miaoermua
 
 ## 脚本架构
 
-- **Shell (POSIX sh)**，目标平台 OpenWrt 24.10+
+- **Shell (POSIX sh)**，目标平台 iStoreOS 25.12 / OpenWrt 25.12
 - 防火墙检测: `detect_firewall()` → fw3(iptables) vs fw4(nftables)
 - 关键函数: `install_leigodacc()`, `uninstall_leigodacc()`, `ensure_fw4_tproxy()`, `setup_fw4_integration()`, `switch_mode()`, `fix_acc_core_conf()`
 - UCI 配置: `ensure_uci_config()` 管理 `/etc/config/leigod`

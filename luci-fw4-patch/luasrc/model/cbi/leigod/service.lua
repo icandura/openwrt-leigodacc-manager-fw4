@@ -7,12 +7,12 @@ local fw_type = "iptables (fw3)"
 local fw_recommend = ""
 if fs.access("/usr/sbin/fw4") or fs.access("/usr/sbin/nft") then
     fw_type = "nftables (fw4)"
-    fw_recommend = "检测到 fw4: 请确保 acc_core_conf.json 中 tproxy_ip 为路由器 LAN IP。如加速失败请运行诊断。"
+    fw_recommend = "检测到 fw4: 实际加速参数保存在 /etc/config/acc_firewall.ini (backend/mode/tproxy_ip)。如加速失败请运行诊断。"
 end
 
 m = Map("accelerator")
 m.title = "雷神加速器配置"
-m.description = "控制加速器设置"
+m.description = "控制加速器设置。注意: v1.2.2.x 引擎的设备加速由手机 APP 通过 5588 接口下发，本页的 UCI 开关可能不生效；切换 TUN/TPROXY 请用管理器菜单 5 或直接修改 acc_firewall.ini 的 mode 字段。"
 
 -- Firewall info (read-only, fw4 adapted)
 s = m:section(TypedSection, "system")

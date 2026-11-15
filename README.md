@@ -1,13 +1,14 @@
 # openwrt-leigodacc-manager-fw4
 
-雷神加速器 OpenWrt 插件管理器 — fw4/nftables 适配版
+雷神加速器 OpenWrt 插件管理器 — iStoreOS 25.12 适配版
 
-> **基于** [miaoermua/openwrt-leigodacc-manager](https://github.com/miaoermua/openwrt-leigodacc-manager) 修改，适配 OpenWrt 24.10+ fw4/nftables 防火墙。
+> **基于** [miaoermua/openwrt-leigodacc-manager](https://github.com/miaoermua/openwrt-leigodacc-manager) 修改，适配 iStoreOS 25.12（OpenWrt 25.12 / apk）+ fw4/nftables 防火墙。
 
 ## 特性
 
 - ✅ **单文件部署** — 只需 `leigod-fw4.sh`，所有组件内嵌
 - ✅ **fw4/nftables 适配** — hotplug 脚本守护动态规则，iptables-nft 兼容层
+- ✅ **apk / opkg 双栈** — 自动识别包管理器，OpenWrt 25.12 / iStoreOS 25.12 原生可用
 - ✅ **LuCI 全中文界面** — 6 个标签页：服务配置/设备管理/自动暂停/网络诊断/使用须知/APP下载
 - ✅ **自动暂停时长** — 空闲检测 + 书签一键获取 Token → 自动暂停计费
 - ✅ **网络诊断** — 延迟 Ping 测试 (网关/DNS/TURN)，加速节点分析，排版对齐报告
@@ -33,6 +34,18 @@ chmod +x /root/leigod-fw4.sh
 ```
 
 > **不需要** `luci-fw4-patch/` 目录或 `auto-pause.sh` 独立文件。全部内嵌。
+
+### OpenWrt 25.12 / iStoreOS 25.12
+
+包管理器已从 opkg 切换为 apk，本脚本会自动适配，但 LuCI 页面仍依赖 Lua 兼容层：
+
+```bash
+apk list --installed | grep -E 'luci-compat|luci-lua-runtime'   # 确认已安装
+apk add luci-compat luci-lua-runtime                            # 缺失时补装
+/root/leigod-fw4.sh env                                         # 只读环境自检
+```
+
+缺失该兼容层时，菜单不会出现，访问页面返回 404 `No page is registered`。
 
 ## 菜单
 

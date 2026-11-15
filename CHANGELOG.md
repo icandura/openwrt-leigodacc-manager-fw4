@@ -1,6 +1,314 @@
 # Changelog — LeigodAcc Manager fw4 适配版
 
-基于 [openwrt-leigodacc-manager](https://github.com/miaoermua/openwrt-leigodacc-manager) 修改，适配 OpenWrt 24.10+ fw4/nftables 防火墙。
+基于 [openwrt-leigodacc-manager](https://github.com/miaoermua/openwrt-leigodacc-manager) 修改，适配 iStoreOS 25.12（OpenWrt 25.12 / apk）+ fw4/nftables 防火墙。
+
+## v3.2.0 (2026-11-06) — DNS 兜底 + 数据面诊断（解决「隧道空转、游戏不加速」）
+
+### 故障现象与根因
+
+真机上出现：APP 显示加速中、`GAMEACC` 规则计数在涨、隧道心跳正常（`42.240.152.197:1905`、
+`14.17.92.181:27438`），但**游戏完全没被代理**（`S5 UDP` 计数 0、隧道字节只有心跳量、
+`direct_Game` 集合为空），查 IP 站点显示本地地址。
+
+逐层定位后确认根因：**路由器本机解析不到引擎的 CDN 域名**。
+
+```
+nslookup dfs01.nn.com            → 只返回 CNAME，没有 A 记录（dnsmasq / :53）
+nslookup dfs01.nn.com 127.0.0.1:5335 → A 记录齐全（MosDNS）
+nslookup dfs01.nn.com 223.5.5.5      → A 记录齐全（公共 DNS）
+web_api.log → Failed to download file(.../mac.json) HTTP Status: 0
+```
+
+引擎的路由数据全部来自 `dfs01.nn.com`：
+
+| 文件 | 作用 | 条数 |
+|---|---|---|
+| `mac.json` | 设备类型（MAC OUI）库 | 309 |
+| `cidrs.txt` | **该走隧道的游戏网段** | 6624 |
+| `cidrs_direct.txt` | 该直连的网段（填 `direct_Game`） | 9 |
+
+三份都拿不到 → 引擎没有分流表 → 一切按直连处理 → 隧道只剩心跳。
+
+### 1. 新增「DNS 兜底」（菜单 D / CLI `dns-guard`）
+
+- 依次检测 `dfs01.nn.com`、`opapi.xxghh.biz`、`opapi1.xxghh.biz`、`nbox.nn.com`
+  的本机解析；本机失败而公共 DNS（默认 223.5.5.5）可解析时，把 IPv4 固定进 `/etc/hosts`
+- 写入内容用 `# >>> leigod-fw4 dns guard >>>` / `# === leigod-fw4 dns guard end ===`
+  包裹，重复执行只保留一个块，可一键移除
+- 本机解析正常的域名不做固定，避免 CDN IP 过期影响
+- 菜单 D 提供「写入/移除/查看」三个动作，并可选立即重启服务
+- `dns-guard` cron 每 6 小时刷新一次（CDN IP 会变）
+- 安装完成后若检测到 `dfs01.nn.com` 本机解析失败，会直接给出倒 WARN 指引
+
+### 2. 诊断页新增四项「假加速」检查
+
+| 检查 | 判据 |
+|---|---|
+| 引擎 CDN 域名本机可解析 | `nslookup dfs01.nn.com` 必须拿到 A 记录 |
+| 分流表已加载 | `ipset list direct_Game` 非空 |
+| 加速隧道心跳 | `acc_Game.log` 的 `TunnelHeartBeat`（含服务器与延迟） |
+| TPROXY 策略路由 | `ip rule` 有 `fwmark 0x99` 且 `table 99` 有 `local default dev lo` |
+
+外加「加速规则注入成功」（扫引擎日志 `add ip routes failed` 等）。
+
+### 3. 测试
+
+新增 `scripts/test-dns-guard.sh`：用桩 `nslookup` 模拟「本地只回 CNAME、公共 DNS 正常」，
+验证固定、幂等、跳过健康域名、移除还原，共 11 项断言。
+
+### 4. 顺带修复
+
+- 卸载：`rm -f /tmp/acc_install_lib`（目录，无效）改为 `rm -rf`；补清引擎的 `.lock` 文件；
+  iptables 符号链接从「删除」改为恢复为 `xtables-nft-multi`
+- `validate-shell.py` 支持跨行单引号（多行 awk 程序），消除误报
+
+## v3.1.3 (2026-11-06) — 卸载彻底化
+
+真机测试卸载后发现：**引擎 INI 配置、crontab、自动暂停文件、LuCI 菜单缓存**都还有残留，
+LuCI 侧边栏仍显示「雷神加速器」，点进去 404。原因是 v1.x 时代的卸载只覆盖了老布局。
+
+### 1. 卸载覆盖全部新布局产物
+
+| 类别 | 新增清理项 |
+|---|---|
+| 引擎配置 | `/etc/config/accelerator.ini`、`acc_firewall.ini`、`acc_version.ini`、`acc_core_conf.json`、`ipdatacloud_country.xdb`、`upgrade_data.json`、旧 `/etc/config/leigod` |
+| 运行时 | `/tmp/acc`（锁/日志/JSON/socket）、`/tmp/acc_install_lib`、`acc-lib.tar.gz`、`acc-bundle-*.tar.gz`、`acc_domain_config_*.json`、`leigod_acc_*.log` |
+| cron | **无条件**删除 `leigod-auto-pause`、`leigod-fw4.sh fix-tproxy` 及含 `leigod` 的行（原先只在自动暂停脚本存在时才删） |
+| 自动暂停 | 脚本/配置/状态/日志/离家模式标记，全部**无条件**清理 |
+| LuCI | 12 个 Lua 文件 + i18n lmo + `menu.d`/`acl.d`/`view` 的 JS 时代残留 |
+| 防火墙 | UCI 规则（循环删除所有 `LeigodAcc`）、hotplug、**mangle/filter/nat 三表 GAMEACC**、`ipset` 的 `direct_*/target_*/proxy_*`、`nft table inet tproxy_table` |
+| 其他 | opkg 垫片、`iptables-nft` 符号链接、LuCI indexcache |
+
+### 2. 优先调用官方卸载脚本
+
+安装包自带 `/usr/sbin/leigod/leigod_uninstall.sh`（官方 web 接口卸载也用它）。
+现在先执行它，再做手动兜底清理，避免漏掉官方后续新增的文件。
+
+### 3. 卸载判定放宽
+
+原来只要 `/usr/sbin/leigod` 不存在就报「未安装」，导致**半残留状态无法再次卸载**。
+新增 `leigod_installed()`：二进制目录 / init 脚本 / UCI / INI / LuCI 控制器 / 包名，
+任一存在即可卸载。
+
+### 4. LuCI 菜单 404 的成因与处理
+
+菜单条目来自 `/usr/lib/lua/luci/controller/acc.lua`（已删除，所以路由 404）。
+侧边栏仍显示是**浏览器/主题侧缓存**。现在卸载结束会：
+
+- `rm -f /tmp/luci-indexcache*`
+- 重启 `rpcd`（使所有 LuCI 会话失效，需要重新登录）
+- 重启 `uhttpd`
+
+并提示用户重新登录后台或 `Ctrl+Shift+R` 强制刷新。
+
+### 5. 卸载后自检
+
+新增残留扫描：逐项检查配置/init/LuCI/cron/运行目录，输出
+`[OK] 卸载完成，未发现残留` 或列出未清理项；同时说明**有意保留**的两项
+（`/etc/config/upnpd` 的 UPnP 设置、`/etc/sysctl.d/99-leigod-latency.conf` 内核调优）。
+
+### 6. 新增测试
+
+`scripts/test-uninstall-coverage.sh`：静态校验卸载函数仍引用全部 28 个已知产物路径，
+防止后续改动漏项。
+
+## v3.1.2 (2026-11-05) — 桥自检改为「页面探测」+ 两处噪声修正
+
+### 1. `verify_luci` 的桥自检彻底换掉
+
+v3.1.1 用 `ucode` 独立进程 `require("luci.ucodebridge")` 仍不可靠——`luci.ucodebridge`
+依赖 CGI/uhttpd 环境（`luci.http`、`luci.template` 在独立进程里初始化失败），
+在真机上必然误报 FAIL。
+
+改为**探测效果而非机制**：
+
+```
+curl -sk http://127.0.0.1:<uhttpd端口>/cgi-bin/luci/admin/services/acc/service
+```
+
+| 返回码 | 判定 |
+|---|---|
+| **404** | Lua 控制器未被加载 → FAIL，并给出修复命令 |
+| 401 / 403 / 200 / 301 / 302 | 路由已注册（未登录返回鉴权码属正常）→ OK |
+| 000 | 本机访问不到 LuCI → WARN（跳过） |
+
+端口从 `uhttpd.main.listen_http` / `listen_https` 解析，默认 80。
+
+### 2. 模板模式被误判为「模式不一致」
+
+诊断页出现 `Mode mismatch: init script specifies ${mode} but process is running as tproxy`。
+原因：`model` 一致性检查把 `${mode}` 当成字面模式值。已改为
+`and not resp.init_script.template_mode` 时跳过该比较。
+
+### 3. 错误日志仍显示小时前的旧记录
+
+v3.1.1 只做了白名单过滤，但 `tail -5` 取的是**整个文件**最后 5 条匹配行，
+几小时前那次网络故障的记录仍会被翻出来。改为先 `tail -n 200` 再看，
+并把可选功能的噪声（`log report switch failed` / `router_log_report_config`）加入白名单。
+
+## v3.1.1 (2026-11-05) — 修正 v3.1.0 引入的三处判断错误
+
+真机回归时发现 v3.1.0 有三个自身 bug（都与"判断条件写错"有关，不影响插件功能）：
+
+### 1. Lua 桥自检永远 FAIL（误报）
+
+`require("luci.dispatcher")` 在裸 `lua -e` 里**不可能成功**——`dispatcher.lua` 第一行就是
+`local http = _G.L.http`，而 `_G.L` 只存在于 ucode→Lua 桥里。同理 `require("luci.cbi")`
+也会连带 require dispatcher 而失败。
+
+改为**按真实调度路径自检**：用 ucode 创建 Lua VM 并 `require("luci.ucodebridge")`
+（与 `dispatcher.uc` 的 `L.invoke('require','luci.ucodebridge')` 完全一致），
+再检查 `ucodebridge.lua` / `cbi.lua` 文件存在。
+
+### 2. `-m ${mode}` 模板识别失效
+
+`args_line:find("%-m ${mode}", 1, true)` —— plain 模式下 `%-m` 是字面量（反斜杠不会转义），
+永远匹配不到。改为 `args_line:find("-m ${mode}", 1, true)`。
+症状：诊断页仍显示「模式标志 MISSING → UNKNOWN / 短格式 No」，并因此产生 1 个假的 error 计数。
+
+### 3. `acc_firewall.ini` 解析漏掉下划线键
+
+`line:match("^(%w+)=(.*)$")` 中 `%w` 不含 `_`，导致 `tproxy_ip` 解析为 nil，
+诊断页出现「acc_firewall.ini tproxy_ip=nil」。改为 `^([%w_]+)=`。
+
+### 4. 附带改进
+
+- 错误日志扫描过滤引擎的**无害噪音**：`acc_objs is empty`、
+  `delete iptables rule failed`（清理不存在的规则）、`unknow acc mode`、`acceleration is empty`
+- JSON 诊断的依赖表补上 `luci-lua-runtime`
+- `verify_luci` 的「设备条目数」不再因 `grep -c` 退出码而打印两行 `0`
+- 新增 `scripts/check-luci-sync.py`：校验内嵌 Lua 与 `luci-fw4-patch/` 副本一致性
+
+## v3.1.0 (2026-11-05) — 对齐官方 v1.2.2.x 引擎的 INI 配置模型
+
+真机验证发现：官方安装器 **v1.2.2.x** 已把加速参数从 UCI/JSON 迁到 **INI**，且 `tproxy_ip`
+是**按后端固定的哨兵值**（不是 LAN IP）。旧版管理器的「强制改成 LAN IP」逻辑会把配置改坏。
+本版按官方 `lib/setup.sh` 的实现对齐。
+
+### 1. 双布局识别（new / legacy）
+
+| 布局 | 判定 | 权威来源 | tproxy_ip 语义 |
+|---|---|---|---|
+| `new` | 存在 `/etc/config/acc_firewall.ini` | `[firewall] backend/mode/tproxy_ip` | iptables→`10.20.30.40`，nftables→`0.0.0.0`（官方 `get_tproxy_ip_by_backend()`） |
+| `legacy` | 无 INI（v1.2.2.13 及更早） | `/tmp/acc/acc_core_conf.json` | 必须是 LAN IP，`acc_mode` 必须为 2 |
+
+- `fix_acc_core_conf()` 改为分发器，新增 `fix_acc_new_layout()` / `fix_acc_legacy_layout()`
+- **new 布局下不再改写 tproxy_ip 为 LAN IP**；只补齐缺失键、把非哨兵值校正回哨兵值、
+  并把 JSON 的 `tproxy_ip` 对齐到 INI（不再自造数值）
+- 配置真的发生变化时才重启服务（新增 `restart_acc_service()`），避免每次 cron 都打断加速
+
+### 2. 端口检测改用 `/proc/net/tcp`
+
+iStoreOS 25.12 **没有 `ss`**（`apk add iproute2-ss` 报无此包），netstat 也可能缺失。
+新增 `port_listening()`：直接解析 `/proc/net/tcp`、`/proc/net/tcp6`，按十六进制端口
+（5588 → `15D4`）与 `st == 0A`（LISTEN）判断。Shell 侧与 Lua 诊断页同步改造。
+
+### 3. 安装后健康检查 `acc_health_check()`
+
+安装/重启后最多等待 20 秒确认 5588 是否 LISTEN；未就绪时明确报错，并给出可执行线索：
+
+- 检测 `acc_daemon.log` 中 `child process exit` 的重复次数 → 判定「web 子进程崩溃循环」
+- 若 `web_api.log` 出现 `start global config manager failed`，提示这是「拉取雷神全局配置失败」
+  （双栈网络下 IPv6 不可达且客户端不回落 IPv4 / DNS 异常 / 上游接口故障），并给出
+  `curl -4` / `curl -6` 对照命令
+
+### 4. 诊断页增强（Lua，内嵌 + 独立副本同步）
+
+- ✅ **新增「web 子进程崩溃循环」error 级检查**（本次真实故障此前被淹没）
+- ✅ 新增 `acc_firewall.ini` 解析与哨兵值校验（`backend`/`mode`/`tproxy_ip`）
+- ✅ `tproxy_ip` 校验改为布局感知：new 布局比 INI，legacy 比 LAN IP
+- ✅ init 脚本参数识别 `-m ${mode}` 模板（不再误报 `MISSING`）
+- ✅ 开机自启改用 `os.execute` 退出码（procd `enabled` 不打印文字，此前恒报 No）
+- ✅ 错误日志扫描只取 `ERROR|WARN|FATAL` 行（`child process exit ... INFO` 不再算错误）
+- ✅ 文本报告同步：端口用 `/proc/net/tcp`、tproxy_ip 对比 INI、模板模式识别
+
+### 5. 其他修复
+
+- `switch_mode()`（菜单 5）：new 布局下改为读写 `acc_firewall.ini` 的 `mode=` 并重启，
+  不再用 sed 改 init 脚本（会把 `args="-m ${mode}"` 模板改坏）；legacy 逻辑保留
+- `ensure_uci_config()`：先创建 `/etc/config/accelerator` 再 `uci set`
+  （25.12 的 uci 对不存在的配置直接报 `Entry not found`），并静默 stderr
+- `verify_luci()` 的 Lua 桥自检去掉 `require("luci.http")`（25.12 无此 Lua 模块，
+  http 由 `_G.L.http` 注入），此前误报 FAIL
+- `luci-fw4-patch/` 全部文件统一为 LF（原先为 CRLF）
+- 服务配置页文案更正：说明 v1.2.2.x 的实际参数在 INI、设备由 APP 下发
+- 新增 `scripts/validate-lua.py`（无 Lua 解释器环境下的块/括号结构校验）
+
+### 修改文件
+
+| 文件 | 变更 |
+|------|------|
+| `leigod-fw4.sh` | 双布局配置修复、/proc 端口检测、健康检查、诊断增强、switch_mode 改造 |
+| `luci-fw4-patch/luasrc/controller/acc.lua` | 崩溃循环检测、INI 校验、模板模式识别、开机自启、日志过滤、端口检测 |
+| `luci-fw4-patch/luasrc/model/cbi/leigod/service.lua` | 文案更正（INI 为准 / APP 下发设备） |
+| `scripts/validate-lua.py` | 新增 |
+
+## v3.0.0 (2026-11-05) — OpenWrt 25.12 / iStoreOS 25.12 (apk) 适配
+
+目标环境：iStoreOS 25.12.5（OpenWrt 25.12.5 / kernel 6.12 / x86_64 / apk-tools 3.0.5，**无 opkg 二进制**）。
+
+### 1. 新增 apk/opkg 双栈包管理抽象层
+
+全文 50+ 处 `opkg` 调用改为统一封装，按 `command -v apk` 自动选择后端：
+
+| 封装函数 | apk | opkg |
+|---|---|---|
+| `pkg_installed` | `apk info -e` → 回落 `apk info \| grep -x` | `opkg list-installed \| grep` |
+| `pkg_available` | `apk search -x` → 回落 `apk search` | `opkg list \| grep` |
+| `pkg_update` | `apk update` | `opkg update` |
+| `pkg_install_raw` | `apk add` | `opkg install` |
+| `pkg_remove_raw` | `apk del` | `opkg remove` |
+| `pkg_arch` | `apk --print-arch` | `opkg print-architecture` |
+| `pkg_hint` | `apk update && apk add …` | `opkg update && opkg install …` |
+| `pkg_show_feeds` | `/etc/apk/repositories.d/*.list` | `/etc/opkg/distfeeds.conf` |
+
+旧名 `safe_opkg_install()` 保留为 `safe_pkg_install()` 的别名。
+
+### 2. 官方安装器 opkg 垫片
+
+雷神官方 `plugin_install.sh` 内部仍调用 `opkg`，在 apk 系统上会全部报 `command not found`。新增 `install_opkg_shim()`：在 `/tmp/leigod-pkgshim/opkg` 生成 opkg→apk 转换垫片（`update/install/remove/list/list-installed/files/print-architecture`），**仅在那一次官方脚本调用时通过 PATH 注入**，不写入 `/usr/sbin`。卸载时自动清理。
+
+### 3. 包名差异修正
+
+| 用途 | opkg (≤24.10) | apk (≥25.12) |
+|---|---|---|
+| pcap 运行库 | `libpcap` | **`libpcap1`** |
+| UPnP 服务 | `miniupnpd` | **`miniupnpd-nftables`** |
+
+- `set_fw_packages()` 按包管理器设置 `PKG_LIBPCAP` / `PKG_UPNP`
+- 新增 `ensure_upnpd()`：UPnP 缺失时尝试安装，并**不再因 `/etc/config/upnpd` 缺失而中断整个安装**
+- 诊断页/诊断报告的包检查对 `libpcap`↔`libpcap1` 双向探测
+
+### 4. LuCI：沿用 Lua CBI + 显式要求兼容层
+
+OpenWrt 25.12 的 LuCI 调度器已改为 ucode，但官方保留 Lua 兼容通道：`dispatcher.uc` 仍会 glob `/usr/lib/lua/luci/controller/*.lua`，在 `luci-lua-runtime` 存在时通过 `runtime.call('luci.dispatcher','process_lua_controller', …)` 加载。
+
+- `luci-compat`、`luci-lua-runtime` 提升为**硬依赖**，安装时检测并补装
+- `verify_luci()` 重写为 5 段：兼容层包 → **Lua 调度桥自检**（`lua -e 'require("luci.dispatcher")'`）→ 12 个文件 → UCI → 自动暂停
+- 缓存清理从 `rm -rf /tmp/luci-*` 改为 `rm -f /tmp/luci-indexcache*` + 重启 `rpcd`
+- 使用须知页补充依赖与兼容层说明
+
+### 5. 移除 .ipk 分发路径
+
+- 菜单选项 8（Lean IPKG 版）在 apk 系统上**直接返回并提示"25.12 不支持 .ipk"**，不再尝试下载安装
+- `install_compatibility_dependencies()` 删除 23.05.3 的 .ipk 直链下载逻辑（仅保留给 opkg 系统），改为按软件源可用性安装
+- 架构检测改 `pkg_arch`
+
+### 6. 其他
+
+- 新增 CLI `leigod-fw4.sh env`：打印固件/内核/架构/防火墙/包管理/LuCI 兼容层状态（只读）
+- 主菜单与帮助显示当前包管理器；安装前打印 APK 软件源
+- 安装完成后提示 Docker 网桥（`172.17.0.0/16`）不在 acc-gw 默认直连列表，便于排查容器流量异常
+- 新增 `scripts/validate-shell.py`：无 POSIX shell 环境下的结构自检（heredoc/块/大括号/CRLF）
+
+### 修改文件
+
+| 文件 | 变更 |
+|------|------|
+| `leigod-fw4.sh` | 包管理抽象层 + 垫片 + UPnP + LuCI 兼容层 + 诊断/帮助/CLI 全面 apk 化 |
+| `luci-fw4-patch/luasrc/controller/acc.lua` | 包检查双栈探测（`apk info -e` + `opkg list-installed`） |
+| `luci-fw4-patch/luasrc/view/leigod/notice.htm` | 依赖清单按 apk/opkg 分列 + LuCI 兼容层说明 |
+| `scripts/validate-shell.py` | 新增结构校验器 |
 
 ## v2.5.2 (2026-08-15) — LuCI 兼容性修复 + 部署修复
 
@@ -853,3 +1161,32 @@ P4: 全部不可用 → 跳过并记录日志
 | `get_essential_packages()` | 必备包列表(按防火墙) |
 | `get_optional_packages()` | 增强包列表(按防火墙) |
 | `get_check_packages()` | 安装后检查清单(按防火墙) |
+
+## v3.2.1 (2026-11-06) — 禁用官方自动升级 + 隧道数据面定性
+
+### 1. 菜单 U / CLI `disable-upgrade`
+
+官方 1.2.2.78 只发布了 arm64 包（`acc_version.json` 里 `name=acc-gw.router.arm64`，
+`md5_list` 只有 arm64）。amd64 上升级会：下载 3.2MB 包 → 解包 → exec `acc-setup.arm64` 失败，
+但在此之前已经**杀掉 daemon**，导致加速每隔几分钟被中断。
+
+本次实测：给 `nbox.nn.com` 钉 hosts **无效**（tarball 两分钟就回来，下载地址来自别处）。
+有效做法是从 `/etc/init.d/acc` 移除 `acc_upgrade_monitor` 那个 procd 实例（备份
+`/etc/init.d/acc.leigod_bak`，可一键还原）。
+
+### 2. 隧道数据面定性（给官方的证据）
+
+在 iptables 规则、策略路由、端口监听、隧道心跳全部正常的前提下：
+
+```
+22:53  隧道流 201 包 / 9849 字节
+22:58  隧道流 244 包 / 11956 字节     ← 增量 = 5 分钟心跳量（60×35B）
+```
+
+同一时段 `GAMEACC` 的 TCP/UDP TPROXY 计数增长上千包——**引擎收下了流量，但没有送进隧道**。
+`direct_Game` 始终为空（`cidrs_direct.txt` 的 9 条从未进集合），`S5 UDP` 计数为 0。
+
+### 3. 其他
+
+- 状态检查（S）自动重建缺失的 fw4 hotplug 守护脚本
+- `validate-shell.py` 修正跨行单引号/`"'"`/`$()` 的误报；关键字平衡检查改为由 `bash -n` 负责

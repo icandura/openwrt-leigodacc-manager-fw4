@@ -1,14 +1,154 @@
 # LeigodAcc Manager fw4 适配版 — 安装与使用指南
 
-基于 [openwrt-leigodacc-manager](https://github.com/miaoermua/openwrt-leigodacc-manager) 修改，适配 OpenWrt 24.10+ fw4/nftables 防火墙。
+基于 [openwrt-leigodacc-manager](https://github.com/miaoermua/openwrt-leigodacc-manager) 修改，适配 iStoreOS 25.12（OpenWrt 25.12 / apk）+ fw4/nftables 防火墙。
 
-**当前版本**: v2.4.1 (2026-06-10) — 离家模式 Bug 修复
+**当前版本**: v3.0.0 (2026-11-05) — OpenWrt 25.12 / iStoreOS 25.12 (apk) 适配
 
 ## 前置条件
 
 - OpenWrt / ImmortalWrt 路由器（fw3 或 fw4/nftables）
+- **OpenWrt 25.12+ / iStoreOS 25.12+**：使用 apk 包管理器，需确认 `luci-compat` + `luci-lua-runtime` 已安装
 - 已联网，能访问 `webapi.leigod.com`
 - 雷神加速器账号
+
+## OpenWrt 25.12 / iStoreOS 25.12 说明
+
+| 项 | 25.12 现状 | 本脚本处理 |
+|---|---|---|
+| 包管理器 | apk-tools 3.x，**没有 opkg 命令** | 自动检测，全部改用 `apk add/del/info` |
+| 软件源 | `/etc/apk/repositories.d/*.list` | 安装前打印 |
+| LuCI 调度器 | ucode（`/usr/share/ucode/luci/`） | 依赖 `luci-compat` + `luci-lua-runtime` 桥接 Lua CBI |
+| 包名 | `libpcap1`、`miniupnpd-nftables` | 自动映射 |
+| `.ipk` 安装 | 不支持 | 菜单选项 8 直接提示"25.12 不支持" |
+| 官方安装脚本 | 内部仍调用 `opkg` | 自动注入 `/tmp/leigod-pkgshim/opkg` 垫片 |
+| 防火墙 | fw4/nftables + `iptables-nft` | 与其它 fw4 设备行为一致 |
+
+> **LuCI 页面不出现 / 404 "No page is registered"**：说明 Lua 兼容层缺失。执行：
+> ```bash
+> apk add luci-compat luci-lua-runtime
+> rm -f /tmp/luci-indexcache*
+> /etc/init.d/rpcd restart && /etc/init.d/uhttpd restart
+> ```
+
+### 快速自检
+
+```bash
+/root/leigod-fw4.sh env      # 只读：打印固件/内核/架构/防火墙/包管理/LuCI 兼容层
+/root/leigod-fw4.sh verify-luci
+```
+
+## 加速配置：新旧两种布局
+
+官方引擎 v1.2.2.x 起把加速参数放进了 INI，管理器会自动识别并分别处理：
+
+| 布局 | 判定 | 权威文件 | `tproxy_ip` 含义 |
+|---|---|---|---|
+| **new** | 存在 `/etc/config/acc_firewall.ini` | `[firewall] backend` / `mode` / `tproxy_ip` | 按后端固定的**哨兵值**：iptables→`10.20.30.40`，nftables→`0.0.0.0`（**不是** LAN IP） |
+| legacy | 无 INI（v1.2.2.13 及更早） | `/tmp/acc/acc_core_conf.json` | **必须**是 LAN IP，`acc_mode` 必须为 2 |
+
+> 不要手动把 `tproxy_ip` 改成 LAN IP：它是 TPROXY 的转发目标，官方设计就是这么写的。
+> `fix-tproxy`（cron 每 5 分钟）只会补齐缺失字段、把非标准值校正回哨兵值，并把 JSON 对齐到 INI。
+
+### 5588 端口未监听（手机 APP 连不上）
+
+管理器安装完成后会自动等待并检查 5588；若失败会打印原因。手动排查：
+
+```bash
+ps ww | grep '[a]cc-gw'                       # daemon / web 子进程
+awk '$4=="0A" && substr($2,length($2)-4)==":15D4"' /proc/net/tcp   # 5588 是否 LISTEN（十六进制）
+tail -40 /tmp/acc/log/web_api.log             # web 子进程报错
+tail -40 /tmp/acc/log/acc_daemon.log          # 是否反复 child process exit
+```
+
+常见原因：
+
+1. **web 子进程反复退出（`child process exit, status:0`）+ `start global config manager failed`**
+   → 插件拉取 `opapi.xxghh.biz` / `resources.leigodtech.com` 失败。双栈网络下 IPv6 不可达、
+   而引擎的 HTTP 客户端不回落 IPv4 时会这样。先确认：
+   ```bash
+   curl -4 -m5 -o /dev/null -w 'v4=%{http_code}\n' https://opapi.xxghh.biz/common/comm/dict/getDictItems/LeigodBox_GlobalConfig/
+   curl -6 -m5 -o /dev/null -w 'v6=%{http_code}\n' https://opapi.xxghh.biz/common/comm/dict/getDictItems/LeigodBox_GlobalConfig/
+   ```
+   v4 通、v6 不通 → 属于网络环境问题；可先 `/etc/init.d/acc restart` 重试，或按需处理 IPv6。
+2. **`tproxy_ip` 被手动改成了 LAN IP** → 执行 `/root/leigod-fw4.sh fix-tproxy` 校正。
+3. **INI 缺行**（升级/重装后）→ 同样执行 `fix-tproxy`，会按 backend 补齐。
+
+## 加速不生效？先查 DNS（最常见原因）
+
+引擎的路由数据全部来自 `dfs01.nn.com`：`mac.json`（设备类型）、`cidrs.txt`（该走隧道的
+6624 个游戏网段）、`cidrs_direct.txt`（该直连的 9 个网段）。**只要路由器本机解析不到这个域名，
+引擎就下载不到分流表，隧道会空转——APP 显示加速中、隧道心跳正常，但游戏完全没被代理。**
+
+典型症状（iStoreOS + MosDNS/dnsmasq 组合）：
+
+```bash
+nslookup dfs01.nn.com                 # 只返回 CNAME，没有 A 记录
+nslookup dfs01.nn.com 223.5.5.5       # A 记录齐全
+grep 'Failed to download' /tmp/acc/log/web_api.log | tail -3   # HTTP Status: 0
+ipset list direct_Game                # 空的
+```
+
+处理：管理器菜单 **D（DNS 兜底）** → 1 写入固定记录 → 重启服务。它会：
+
+- 只固定「本机解析失败、公共 DNS 可解析」的域名，写入 `/etc/hosts` 的标记块内
+- 安装 `dns-guard` cron（每 6 小时刷新，应对 CDN 换 IP）
+- 也可以随时用菜单 D → 2 移除
+
+命令行等价操作：
+
+```bash
+/root/leigod-fw4.sh dns-guard      # 立即刷新固定记录
+/etc/init.d/acc restart            # 让引擎重新解析
+ipset list direct_Game | head      # 应出现 0.0.0.0/8 10.0.0.0/8 ... 等 9 条
+```
+
+## 怎么判断“加速是否真的生效”
+
+手机 APP 显示「加速中」并不等于流量真的被代理。在**加速中**的状态下按顺序核对：
+
+| # | 命令 | 期望 |
+|---|---|---|
+| 1 | `ipset list target_Game` | 含正在加速的设备 IP |
+| 2 | `ip rule show` | 有 `99: from all fwmark 0x99 lookup 99` |
+| 3 | `ip route show table 99` | 有 `local default dev lo` |
+| 4 | `iptables -t mangle -L GAMEACC -n -v` | 末尾三条 TPROXY 规则，**计数器在增长** |
+| 5 | `netstat -tlnp \| grep 10.20.30.40` | 代理进程在 TPROXY 端口（如 47843）监听 |
+
+四项中 1–4 都满足、但设备出口 IP 仍为本地时，重点排查两类原因：
+
+1. **IPv6 绕过**：GAMEACC 是 IPv4 规则，设备若走 IPv6 则完全不进链。用 `https://ipinfo.io/json`
+   看返回的 `ip` 是 v4 还是 v6；必要时关闭 LAN IPv6（菜单 7）。
+2. **目标命中直连集合**：`direct_Game` 收录了国内/常用地址，访问国内查 IP 站点会走直连。
+   用境外站点（`ipinfo.io` / `ifconfig.me`）复测，并可用 `ipset test direct_Game <IP>` 验证。
+
+最可靠的判定法：先用 `iptables -v` 记一次计数，然后在设备上**只访问一次**境外站点，再看计数
+哪一条在涨——涨在 TPROXY 说明被代理，涨在 `direct_` 说明直连，都不涨说明根本没进链。
+
+## 卸载说明（菜单 2）
+
+卸载会清理以下内容，并优先调用官方 `/usr/sbin/leigod/leigod_uninstall.sh`：
+
+| 类别 | 清理项 |
+|---|---|
+| 服务 | 停止/禁用 `/etc/init.d/acc`，杀掉 `acc-gw`、`acc_upgrade_monitor`、`monitor.sh` |
+| 引擎配置 | `/etc/config/accelerator`、`accelerator.ini`、`acc_firewall.ini`、`acc_version.ini`、`acc_core_conf.json`、`ipdatacloud_country.xdb`、`upgrade_data.json` |
+| 运行时 | `/tmp/acc`（锁/日志/JSON/socket）、`/tmp/acc*` 下载与缓存、安装日志 |
+| 自动暂停 | 脚本、`/etc/leigod-auto-pause.conf`、状态、日志、离家模式标记 |
+| cron | `leigod-auto-pause`、`leigod-fw4.sh fix-tproxy` 等所有雷神相关行 |
+| 防火墙 | `LeigodAcc` UCI 规则、hotplug 脚本、mangle/filter/nat 三表 `GAMEACC`、`ipset` 集合、`nft table inet tproxy_table` |
+| LuCI | 12 个 Lua 文件、i18n lmo、indexcache |
+| 其他 | opkg→apk 垫片、`iptables-nft` 符号链接 |
+
+**会保留**（如需彻底清除请手动处理）：
+
+- `/etc/config/upnpd` —— 安装时启用的 UPnP 设置（系统级服务，可能还有其他用途）
+- `/etc/sysctl.d/99-leigod-latency.conf` —— 执行过「T. 内核网络调优」时写入的 BBR/fq_codel 参数
+
+### 卸载后侧边栏仍有「雷神加速器」？
+
+控制器文件已删除（路由返回 404），侧边栏残留是**浏览器/主题侧缓存**。管理器在卸载结束时会
+清理 `/tmp/luci-indexcache*` 并重启 `rpcd`（所有 LuCI 会话失效）。请**重新登录**后台；
+若仍显示，用 `Ctrl+Shift+R` 强制刷新或清除该站点数据。
 
 ## 快速安装（单文件）
 
@@ -44,15 +184,16 @@ chmod +x /root/leigod-fw4.sh
 =============================
 OpenWrt LeigodAcc Manager
 防火墙: nftables (fw4)
+包管理: apk (OpenWrt 25.12+)
 
 1. 安装                    # 官方安装脚本
 2. 卸载                    # 完整卸载（含 auto-pause）
 3. 重装/更新               # 卸载 + 重装
 4. 禁用/启用 雷神服务      # 开关服务（保留配置）
 5. 切换运行模式             # TUN ↔ TPROXY
-6. 安装兼容性依赖           # 补全缺失的 opkg 包
+6. 安装兼容性依赖           # 从固件软件源补全依赖
 7. 禁用/启用 IPv6           # 手机游戏优化
-8. 安装 Lean IPKG 版        # 实验性 IPK 安装
+8. 安装 Lean IPKG 版        # 仅 opkg 可用，25.12 提示不支持
 9. 自动暂停时长             # 空闲检测 + API 暂停
 S. 查看服务状态             # 综合诊断
 L. 延迟波动诊断             # Bufferbloat / QoS / PPPoE MSS / TURN 抖动
@@ -261,8 +402,11 @@ leigod-fw4/                          (18 个文件)
 ## CLI 命令
 
 ```bash
-# 静默修复 tproxy_ip + acc_mode（cron 每 2 分钟自动运行）
+# 静默校正加速配置（INI/JSON 对齐，cron 每 5 分钟自动运行）
 /root/leigod-fw4.sh fix-tproxy
+
+# 只更新 LuCI 文件（升级管理器后不必重装插件）
+/root/leigod-fw4.sh apply-luci
 
 # 内核网络调优 — 应用 fq_codel/BBR/conntrack 等低延迟优化参数
 /root/leigod-fw4.sh tune-network
@@ -272,6 +416,9 @@ leigod-fw4/                          (18 个文件)
 
 # LuCI 完整性验证 — 检查 12 个文件 + luci-compat + UCI 配置，自动修复
 /root/leigod-fw4.sh verify-luci
+
+# 环境自检（只读）
+/root/leigod-fw4.sh env
 
 # 手动测试自动暂停（调试用）
 /usr/sbin/leigod-auto-pause.sh 2>&1

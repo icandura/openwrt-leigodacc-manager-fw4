@@ -45,6 +45,462 @@ if ! grep -qi -E "OpenWrt|LEDE|QWRT|ImmortalWrt|iStoreOS" /etc/openwrt_release; 
     echo
     sleep 5
 fi
+PKG_MGR=""
+APK_SHIM_DIR="/tmp/leigod-pkgshim"
+PKG_FAILED=""
+detect_pkg_mgr() {
+    if command -v apk >/dev/null 2>&1; then
+        PKG_MGR="apk"
+    elif command -v opkg >/dev/null 2>&1; then
+        PKG_MGR="opkg"
+    else
+        PKG_MGR="none"
+    fi
+}
+pkg_mgr_name() {
+    case "$PKG_MGR" in
+        apk)  echo "apk (OpenWrt 25.12+)" ;;
+        opkg) echo "opkg (OpenWrt <= 24.10)" ;;
+        *)    echo "未知 (无包管理器)" ;;
+    esac
+}
+pkg_installed() {
+    [ -n "$1" ] || return 1
+    case "$PKG_MGR" in
+        apk)
+            if apk info -e "$1" >/dev/null 2>&1; then
+                return 0
+            fi
+            apk info 2>/dev/null | grep -qx "$1"
+            return $?
+            ;;
+        opkg)
+            opkg list-installed 2>/dev/null | grep -q "^$1 "
+            return $?
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+pkg_available() {
+    [ -n "$1" ] || return 1
+    case "$PKG_MGR" in
+        apk)
+            if apk search -x "$1" >/dev/null 2>&1; then
+                return 0
+            fi
+            apk search "$1" 2>/dev/null | grep -q "^$1-[0-9]"
+            return $?
+            ;;
+        opkg)
+            opkg list 2>/dev/null | grep -q "^$1 "
+            return $?
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+pkg_update() {
+    case "$PKG_MGR" in
+        apk)  apk update >/dev/null 2>&1 ;;
+        opkg) opkg update >/dev/null 2>&1 ;;
+    esac
+    return 0
+}
+pkg_install_raw() {
+    case "$PKG_MGR" in
+        apk)  apk add "$@" ;;
+        opkg) opkg install "$@" ;;
+        *)    return 1 ;;
+    esac
+}
+pkg_remove_raw() {
+    case "$PKG_MGR" in
+        apk)  apk del "$@" ;;
+        opkg) opkg remove "$@" ;;
+        *)    return 1 ;;
+    esac
+}
+safe_pkg_install() {
+    for pkg in "$@"; do
+        echo "[INFO] 安装 $pkg ..."
+        if pkg_install_raw "$pkg"; then
+            :
+        else
+            echo "[ERROR] 安装失败: $pkg"
+            PKG_FAILED="$PKG_FAILED $pkg"
+        fi
+    done
+}
+pkg_hint() {
+    case "$PKG_MGR" in
+        apk)  echo "apk update && apk add $*" ;;
+        opkg) echo "opkg update && opkg install $*" ;;
+        *)    echo "# 请先安装包管理器: $*" ;;
+    esac
+}
+pkg_arch() {
+    case "$PKG_MGR" in
+        apk)  apk --print-arch 2>/dev/null ;;
+        opkg) opkg print-architecture 2>/dev/null | grep "arch" | awk '{print $2}' | grep -vE "all|noarch" | head -1 ;;
+    esac
+}
+pkg_show_feeds() {
+    case "$PKG_MGR" in
+        apk)
+            if [ -d /etc/apk/repositories.d ]; then
+                for f in /etc/apk/repositories.d/*.list; do
+                    [ -f "$f" ] || continue
+                    echo "[$f]"
+                    grep -v '^[[:space:]]*#' "$f" 2>/dev/null | grep -v '^[[:space:]]*$'
+                done
+            elif [ -f /etc/apk/repositories ]; then
+                echo "[/etc/apk/repositories]"
+                grep -v '^[[:space:]]*#' /etc/apk/repositories 2>/dev/null | grep -v '^[[:space:]]*$'
+            else
+                echo "[INFO] 未找到 /etc/apk/repositories.d 配置"
+            fi
+            ;;
+        opkg)
+            [ -f /etc/opkg/customfeeds.conf ] && { echo "[customfeeds.conf]"; cat /etc/opkg/customfeeds.conf; } || echo "[INFO] customfeeds.conf 不存在"
+            [ -f /etc/opkg/distfeeds.conf ] && { echo "[distfeeds.conf]"; cat /etc/opkg/distfeeds.conf; } || echo "[INFO] distfeeds.conf 不存在"
+            ;;
+    esac
+}
+install_opkg_shim() {
+    if [ "$PKG_MGR" != "apk" ]; then
+        return 0
+    fi
+    if command -v opkg >/dev/null 2>&1; then
+        return 0
+    fi
+    mkdir -p "$APK_SHIM_DIR"
+    cat > "$APK_SHIM_DIR/opkg" << 'OPKGSHIM'
+#!/bin/sh
+# opkg -> apk compatibility shim (leigod-fw4.sh)
+# Only used for the official installer; removed on uninstall.
+sub="$1"
+[ -n "$sub" ] && shift
+
+# opkg 时代的包名 → OpenWrt 25.12 apk 包名
+apk_name_alias() {
+    case "$1" in
+        libpcap)             echo libpcap1 ;;
+        miniupnpd)           echo miniupnpd-nftables ;;
+        iptables)            echo iptables-nft ;;
+        kmod-ipt-nat)        echo kmod-nft-nat ;;
+        kmod-ipt-tproxy)     echo kmod-nft-tproxy ;;
+        ip6tables)           echo ip6tables-nft ;;
+        luci-compat)         echo luci-compat ;;
+        *)                   echo "$1" ;;
+    esac
+}
+
+case "$sub" in
+    update)
+        exec apk update
+        ;;
+    install|-i|--force-reinstall)
+        [ $# -eq 0 ] && exit 0
+        # 丢弃 opkg 专有标志 (-y / --force-* / --autoremove ...)
+        force=""
+        for a in "$@"; do
+            case "$a" in
+                --force-reinstall|-f) force="--force-overwrite" ;;
+                --*|-y|-q) : ;;
+                *)
+                    # 先按原名安装；失败再按 25.12 的包名映射重试一次
+                    if ! apk add --allow-untrusted $force "$a" >/dev/null 2>&1; then
+                        m=$(apk_name_alias "$a")
+                        [ "$m" != "$a" ] && apk add --allow-untrusted "$m" >/dev/null 2>&1
+                    fi
+                    ;;
+            esac
+        done
+        # 依赖已由 leigod-fw4.sh 预装并校验，此处不再让官方脚本中断
+        exit 0
+        ;;
+    remove|-r|--force-depends)
+        [ $# -eq 0 ] && exit 0
+        pkgs=""
+        for a in "$@"; do
+            case "$a" in
+                --*|-y|-q) ;;
+                *) pkgs="$pkgs $a" ;;
+            esac
+        done
+        [ -z "$pkgs" ] && exit 0
+        exec apk del $pkgs
+        ;;
+    list-installed)
+        apk info 2>/dev/null
+        ;;
+    list-upgradable)
+        apk version -l '<' 2>/dev/null
+        ;;
+    list)
+        if [ -n "$1" ]; then
+            apk search "$1" 2>/dev/null
+        else
+            apk list 2>/dev/null
+        fi
+        ;;
+    info)
+        if [ -n "$1" ]; then
+            apk info "$1" 2>/dev/null
+        else
+            apk info 2>/dev/null
+        fi
+        ;;
+    files)
+        [ -n "$1" ] && apk info --contents "$1" 2>/dev/null
+        ;;
+    print-architecture)
+        printf 'arch\t%s\t1\n' "$(apk --print-arch 2>/dev/null)"
+        ;;
+    depends|whatdepends)
+        # 官方安装器不使用；返回成功避免中断
+        exit 0
+        ;;
+    *)
+        # 未知子命令：静默成功，避免官方脚本因 set -e 中断
+        exit 0
+        ;;
+esac
+OPKGSHIM
+    chmod +x "$APK_SHIM_DIR/opkg"
+    echo "[INFO] 已生成 opkg→apk 垫片: $APK_SHIM_DIR/opkg"
+}
+remove_opkg_shim() {
+    [ -n "$APK_SHIM_DIR" ] || return 0
+    case "$APK_SHIM_DIR" in
+        /tmp/*) rm -rf "$APK_SHIM_DIR" ;;
+    esac
+}
+DNS_GUARD_BEGIN="# >>> leigod-fw4 dns guard >>>"
+DNS_GUARD_END="# === leigod-fw4 dns guard end ==="
+DNS_GUARD_DOMAINS="dfs01.nn.com opapi.xxghh.biz opapi1.xxghh.biz nbox.nn.com"
+DNS_GUARD_DNS="${DNS_GUARD_DNS:-223.5.5.5}"
+DNS_GUARD_HOSTS="${DNS_GUARD_HOSTS:-/etc/hosts}"
+DNS_GUARD_LOCAL_SERVER="${DNS_GUARD_LOCAL_SERVER:-127.0.0.1}"
+_dns_first_ipv4() {
+    awk '/^Address: *[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ { print $2; exit }' 2>/dev/null
+}
+dns_resolve_ipv4() {   # dns_resolve_ipv4 <domain> [server]
+    if [ -n "${2:-}" ]; then
+        nslookup "$1" "$2" 2>/dev/null | _dns_first_ipv4
+    else
+        nslookup "$1" 2>/dev/null | _dns_first_ipv4
+    fi
+}
+dns_guard_status() {
+    echo "[INFO] 引擎关键域名解析状态 (浏览器/引擎都依赖它们下载分流表):"
+    for _d in $DNS_GUARD_DOMAINS; do
+        _local=$(dns_resolve_ipv4 "$_d" "$DNS_GUARD_LOCAL_SERVER")
+        _pub=$(dns_resolve_ipv4 "$_d" "$DNS_GUARD_DNS")
+        if [ -n "$_local" ]; then
+            echo "  [OK]   $_d -> $_local (本机解析正常)"
+        elif [ -n "$_pub" ]; then
+            echo "  [FAIL] $_d 本机解析失败 (公共 DNS $DNS_GUARD_DNS 可解析为 $_pub)"
+        else
+            echo "  [WARN] $_d 本机与公共 DNS 均无法解析 (上游 DNS 故障?)"
+        fi
+    done
+}
+dns_guard_apply() {
+    local _tmp="/tmp/leigod-hosts.$$" _d _local _pub _ip _added=0 _n
+    [ -f "$DNS_GUARD_HOSTS" ] || : > "$DNS_GUARD_HOSTS"
+    awk -v b="$DNS_GUARD_BEGIN" -v e="$DNS_GUARD_END" '
+        $0 == b { skip = 1; next }
+        $0 == e { skip = 0; next }
+        !skip { print }
+    ' "$DNS_GUARD_HOSTS" > "$_tmp"
+    {
+        echo "$DNS_GUARD_BEGIN"
+        echo "# generated by leigod-fw4.sh dns-guard; refreshed by cron"
+        for _d in $DNS_GUARD_DOMAINS; do
+            _local=$(dns_resolve_ipv4 "$_d" "$DNS_GUARD_LOCAL_SERVER")
+            _pub=$(dns_resolve_ipv4 "$_d" "$DNS_GUARD_DNS")
+            if [ -n "$_local" ]; then
+                echo "  [OK]   $_d 本机可解析 ($_local)，无需固定" >&2
+                continue
+            fi
+            if [ -z "$_pub" ]; then
+                echo "  [WARN] $_d 无法解析 (公共 DNS 也失败)，跳过" >&2
+                continue
+            fi
+            for _ip in $(nslookup "$_d" "$DNS_GUARD_DNS" 2>/dev/null \
+                        | awk '/^Address: *[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ { print $2 }' \
+                        | sort -u | head -2); do
+                echo "$_ip $_d"
+                _added=$((_added + 1))
+            done
+            echo "  [FIX]  $_d -> 固定 $_pub" >&2
+        done
+        echo "$DNS_GUARD_END"
+    } >> "$_tmp"
+    cat "$_tmp" > "$DNS_GUARD_HOSTS"
+    rm -f "$_tmp"
+    if [ "$_added" -gt 0 ]; then
+        echo "[INFO] 已写入 $_added 条 hosts 记录 (块标记: $DNS_GUARD_BEGIN)"
+        echo "[INFO] 引擎需要重启才能重新解析: /etc/init.d/acc restart"
+        return 0
+    fi
+    echo "[INFO] 无需固定 (本机解析均正常)"
+    return 0
+}
+dns_guard_remove() {
+    local _tmp="/tmp/leigod-hosts.$$"
+    [ -f "$DNS_GUARD_HOSTS" ] || return 0
+    awk -v b="$DNS_GUARD_BEGIN" -v e="$DNS_GUARD_END" '
+        $0 == b { skip = 1; next }
+        $0 == e { skip = 0; next }
+        !skip { print }
+    ' "$DNS_GUARD_HOSTS" > "$_tmp"
+    cat "$_tmp" > "$DNS_GUARD_HOSTS"
+    rm -f "$_tmp"
+    echo "[INFO] 已移除 leigod-fw4 dns guard 写入的 hosts 记录"
+}
+dns_guard_install_cron() {
+    local _cron="0 */6 * * * /usr/sbin/leigod/leigod-fw4.sh dns-guard >/dev/null 2>&1"
+    [ -f /usr/sbin/leigod/leigod-fw4.sh ] || return 0
+    if grep -q "leigod-fw4.sh dns-guard" /etc/crontabs/root 2>/dev/null; then
+        echo "[INFO] dns-guard cron 已存在"
+        return 0
+    fi
+    echo "$_cron" >> /etc/crontabs/root
+    /etc/init.d/cron restart >/dev/null 2>&1
+    echo "[INFO] 已安装 dns-guard cron (每 6 小时刷新)"
+}
+dns_guard_menu() {
+    echo
+    echo "============================="
+    echo "  DNS 兜底 (引擎分流数据源)"
+    echo "============================="
+    dns_guard_status
+    echo
+    echo "  1. 写入/刷新 hosts 固定记录"
+    echo "  2. 移除固定记录"
+    echo "  3. 仅查看状态"
+    echo "  0. 返回"
+    echo -n "选择: "
+    read _c
+    case "$_c" in
+        1)
+            dns_guard_apply
+            dns_guard_install_cron
+            echo -n "是否立即重启服务使解析生效? (y/n): "
+            read _y
+            case "$_y" in
+                [Yy]) /etc/init.d/acc restart >/dev/null 2>&1; sleep 6
+                      port_listening 5588 && echo "[INFO] 服务已重启, 5588 正常" \
+                                           || echo "[WARN] 5588 未监听，查看 /tmp/acc/log/web_api.log" ;;
+            esac
+            ;;
+        2)
+            dns_guard_remove
+            sed -i '/leigod-fw4.sh dns-guard/d' /etc/crontabs/root 2>/dev/null
+            /etc/init.d/cron restart >/dev/null 2>&1
+            ;;
+        3)
+            ;;
+        *)
+            ;;
+    esac
+    echo "============================="
+}
+_ACC_UPGRADE_AWK='
+/procd_open_instance[ \t]*$/ { blk = $0 "\n"; keep = 1; inb = 1; next }
+inb {
+    blk = blk $0 "\n"
+    if ($0 ~ /acc_upgrade_monitor/) keep = 0
+    if ($0 ~ /procd_close_instance/) {
+        inb = 0
+        if (keep) printf "%s", blk
+        else print "# [leigod-fw4] upgrade monitor disabled (vendor shipped a wrong-arch bundle)"
+        blk = ""
+    }
+    next
+}
+{ print }
+'
+acc_upgrade_disabled() {
+    [ -f /etc/init.d/acc ] && grep -q 'leigod-fw4] upgrade monitor disabled' /etc/init.d/acc 2>/dev/null
+}
+acc_upgrade_disable() {
+    local init="/etc/init.d/acc" tmp="/tmp/acc.init.$$"
+    [ -f "$init" ] || { echo "[ERROR] 未安装 (/etc/init.d/acc 不存在)"; return 1; }
+    if acc_upgrade_disabled; then
+        echo "[INFO] 自动升级已经处于禁用状态"
+        return 0
+    fi
+    cp -a "$init" "${init}.leigod_bak" 2>/dev/null
+    if awk "$_ACC_UPGRADE_AWK" "$init" > "$tmp" && [ -s "$tmp" ]; then
+        cat "$tmp" > "$init"
+        chmod +x "$init"
+        rm -f "$tmp"
+        echo "[INFO] 已禁用 acc_upgrade_monitor (备份: ${init}.leigod_bak)"
+        echo "[INFO] 副作用: 不会再自动升级。恢复请用菜单 U → 2"
+        /etc/init.d/acc restart >/dev/null 2>&1
+        sleep 5
+        if port_listening 5588; then
+            echo "[INFO] 服务已重启，5588 正常"
+        else
+            echo "[WARN] 5588 未监听，查看 /tmp/acc/log/web_api.log"
+        fi
+        return 0
+    fi
+    rm -f "$tmp"
+    echo "[ERROR] 改写 /etc/init.d/acc 失败，未做任何修改"
+    return 1
+}
+acc_upgrade_enable() {
+    local init="/etc/init.d/acc"
+    if [ -f "${init}.leigod_bak" ]; then
+        cp -a "${init}.leigod_bak" "$init"
+        chmod +x "$init"
+        rm -f "${init}.leigod_bak"
+        echo "[INFO] 已恢复自动升级 (从备份还原)"
+    elif acc_upgrade_disabled; then
+        echo "[WARN] 有禁用标记但没有备份，重装插件可恢复"
+        return 1
+    else
+        echo "[INFO] 自动升级本来就是启用状态"
+        return 0
+    fi
+    /etc/init.d/acc restart >/dev/null 2>&1
+    sleep 4
+    return 0
+}
+acc_upgrade_menu() {
+    echo
+    echo "============================="
+    echo "  官方自动升级 开/关"
+    echo "============================="
+    if acc_upgrade_disabled; then
+        echo "  当前状态: 已禁用 (acc_upgrade_monitor 不在 init 中)"
+    else
+        echo "  当前状态: 启用中"
+    fi
+    echo
+    echo "  说明: 官方 1.2.2.78 只发布了 arm64 包，amd64 上会反复"
+    echo "        下载→解包→exec 失败，并在过程中杀掉 daemon，"
+    echo "        导致加速每隔几分钟被中断。"
+    echo
+    echo "  1. 禁用自动升级"
+    echo "  2. 恢复自动升级"
+    echo "  0. 返回"
+    echo -n "选择: "
+    read _u
+    case "$_u" in
+        1) acc_upgrade_disable ;;
+        2) acc_upgrade_enable ;;
+        *) ;;
+    esac
+    echo "============================="
+}
 detect_firewall() {
     if [ -x /usr/sbin/fw4 ] || [ -x /usr/sbin/nft ]; then
         FW_TYPE="fw4"
@@ -76,6 +532,22 @@ set_fw_packages() {
         PKG_IPSET_TOOL="ipset"
         PKG_IPT_TPROXY_MOD="iptables-mod-tproxy"
     fi
+    if [ "$PKG_MGR" = "apk" ]; then
+        PKG_LIBPCAP="libpcap1"
+        PKG_UPNP="miniupnpd-nftables"
+    else
+        PKG_LIBPCAP="libpcap"
+        PKG_UPNP="miniupnpd"
+    fi
+    PKG_LUCI_UPNP="luci-app-upnp"
+}
+ensure_upnpd() {
+    if pkg_installed "$PKG_UPNP"; then
+        return 0
+    fi
+    echo "[INFO] 未检测到 $PKG_UPNP，尝试安装 UPnP 服务..."
+    pkg_install_raw "$PKG_UPNP" >/dev/null 2>&1
+    pkg_installed "$PKG_UPNP"
 }
 ensure_fw4_tproxy() {
     if [ "$FW_TYPE" != "fw4" ]; then
@@ -90,9 +562,9 @@ ensure_fw4_tproxy() {
         echo "[INFO] nft_tproxy 模块加载成功"
         return 0
     fi
-    if opkg list 2>/dev/null | grep -q "^kmod-nft-tproxy"; then
+    if pkg_available "kmod-nft-tproxy"; then
         echo "[INFO] 正在安装 kmod-nft-tproxy..."
-        if opkg install kmod-nft-tproxy 2>/dev/null; then
+        if pkg_install_raw kmod-nft-tproxy >/dev/null 2>&1; then
             modprobe nft_tproxy 2>/dev/null
             echo "[INFO] kmod-nft-tproxy 安装成功"
             return 0
@@ -136,31 +608,24 @@ check_network() {
 }
 OPKG_FAILED=""
 safe_opkg_install() {
-    for pkg in "$@"; do
-        echo "[INFO] 安装 $pkg ..."
-        if opkg install "$pkg"; then
-            :
-        else
-            echo "[ERROR] 安装失败: $pkg"
-            OPKG_FAILED="$OPKG_FAILED $pkg"
-        fi
-    done
+    safe_pkg_install "$@"
+    OPKG_FAILED="$PKG_FAILED"
 }
 has_netem() {
     lsmod 2>/dev/null | grep -q sch_netem && return 0
     zcat /proc/config.gz 2>/dev/null | grep -q 'CONFIG_NET_SCH_NETEM=y' && return 0
-    opkg list kmod-netem 2>/dev/null | grep -q "^kmod-netem " || return 0
+    pkg_available "kmod-netem" || return 0
     return 1
 }
 get_essential_packages() {
-    local pkgs="libpcap $PKG_IPTABLES $PKG_NAT $PKG_TPROXY"
+    local pkgs="$PKG_LIBPCAP $PKG_IPTABLES $PKG_NAT $PKG_TPROXY"
     [ -n "$PKG_IPT_TPROXY_MOD" ] && pkgs="$pkgs $PKG_IPT_TPROXY_MOD"
     [ -n "$PKG_IPSET" ] && pkgs="$pkgs $PKG_IPSET"
     [ -n "$PKG_IPSET_TOOL" ] && pkgs="$pkgs $PKG_IPSET_TOOL"
     echo "$pkgs"
 }
 get_optional_packages() {
-    local pkgs="kmod-tun $PKG_TPROXY tc-full conntrack"
+    local pkgs="kmod-tun $PKG_TPROXY tc-full conntrack ipset"
     has_netem || pkgs="$pkgs kmod-netem"
     [ -n "$PKG_IPSET" ] && pkgs="$pkgs $PKG_IPSET"
     echo "$pkgs"
@@ -169,7 +634,7 @@ get_check_packages() {
     local pkgs="kmod-tun $PKG_TPROXY tc-full"
     has_netem || pkgs="$pkgs kmod-netem"
     [ -n "$PKG_IPSET" ] && pkgs="$pkgs $PKG_IPSET"
-    pkgs="$pkgs conntrack curl libpcap $PKG_IPTABLES $PKG_NAT"
+    pkgs="$pkgs conntrack curl $PKG_LIBPCAP $PKG_IPTABLES $PKG_NAT"
     [ -n "$PKG_IPT_TPROXY_MOD" ] && pkgs="$pkgs $PKG_IPT_TPROXY_MOD"
     [ -n "$PKG_IPSET_TOOL" ] && pkgs="$pkgs $PKG_IPSET_TOOL"
     echo "$pkgs"
@@ -726,16 +1191,33 @@ function get_debug_status()
   resp.process.pid = pid_parts[1] or "N/A"
   resp.process.vsz_kb = pid_parts[2] or "N/A"
 
-  -- Port listening check: try ss first, fallback to netstat (BusyBox lacks ss)
-  local port_out = util.exec("ss -tlnp 2>/dev/null | grep 5588") or ""
-  if port_out == "" then
-    port_out = util.exec("netstat -tlnp 2>/dev/null | grep 5588") or ""
+  -- Port listening check: parse /proc/net/tcp directly.
+  -- iStoreOS 25.12 has no `ss` binary and netstat may be absent as well;
+  -- /proc/net/tcp prints the port in hex (5588 -> 0x15D4), state 0A = LISTEN.
+  local function port_listen(port)
+    local hex = string.format("%04X", port)
+    local f, line
+    for _, path in ipairs({ "/proc/net/tcp", "/proc/net/tcp6" }) do
+      f = io.open(path, "r")
+      if f then
+        for line in f:lines() do
+          local addr, st = line:match("^%s*%d+:%s*(%S+)%s+%S+%s+(%S+)")
+          if st == "0A" and addr and #addr >= #hex and addr:sub(-#hex) == hex then
+            f:close()
+            return true
+          end
+        end
+        f:close()
+      end
+    end
+    return false
   end
-  resp.process.port_listening = port_out ~= ""
+  resp.process.port_listening = port_listen(5588)
 
-  -- Init script enabled
-  local init_enabled = util.exec("/etc/init.d/acc enabled 2>/dev/null") or ""
-  resp.process.init_enabled = init_enabled:match("running") ~= nil or init_enabled:match("enabled") ~= nil
+  -- Init script enabled: procd's `enabled` prints nothing, only sets an exit
+  -- code, so a text match can never work (and always reported "No").
+  local init_rc = os.execute("/etc/init.d/acc enabled >/dev/null 2>&1")
+  resp.process.init_enabled = (init_rc == 0)
 
   -- === Init Script Analysis ===
   resp.init_script.exists = fs.access("/etc/init.d/acc")
@@ -754,9 +1236,13 @@ function get_debug_status()
     local short_tpr  = args_line:match("%-m tproxy")
     local long_tun   = args_line:match("%-%mode tun")
     local long_tpr   = args_line:match("%-%mode tproxy")
+    -- 25.12 init script uses a template: args="-r daemon -m ${mode} -p 5588"
+    -- (${mode} is filled in from acc_firewall.ini at start time)
+    local tpl_mode   = args_line:find("-m ${mode}", 1, true) ~= nil
 
-    resp.init_script.short_format = (short_tun ~= nil or short_tpr ~= nil)
+    resp.init_script.short_format = (short_tun ~= nil or short_tpr ~= nil or tpl_mode)
     resp.init_script.has_long_format = (long_tun ~= nil or long_tpr ~= nil)
+    resp.init_script.template_mode = tpl_mode
 
     if short_tun then
       resp.init_script.mode_flag = "-m tun"
@@ -764,6 +1250,9 @@ function get_debug_status()
     elseif short_tpr then
       resp.init_script.mode_flag = "-m tproxy"
       resp.init_script.mode_name = "TPROXY"
+    elseif tpl_mode then
+      resp.init_script.mode_flag = "-m ${mode}"
+      resp.init_script.mode_name = "由 acc_firewall.ini 的 mode 决定"
     elseif long_tun then
       resp.init_script.mode_flag = "--mode tun"
       resp.init_script.mode_name = "TUN (LONG FORMAT)"
@@ -797,7 +1286,18 @@ function get_debug_status()
     local tproxy = conf_raw:match('"tproxy_ip":"([^"]*)"')
     resp.core_config.tproxy_ip = tproxy or "not found"
     local lan_ip = uci:get("network", "lan", "ipaddr") or ""
-    resp.core_config.tproxy_ip_ok = (tproxy == lan_ip)
+    -- New layout: acc_firewall.ini carries the authoritative TPROXY target
+    -- (a per-backend sentinel, NOT the LAN IP). Legacy: LAN IP.
+    local expect = lan_ip
+    local ini_present = fs.access("/etc/config/acc_firewall.ini")
+    if ini_present then
+      for line in io.lines("/etc/config/acc_firewall.ini") do
+        local v = line:match("^tproxy_ip=(.*)$")
+        if v then expect = v end
+      end
+    end
+    resp.core_config.expected_tproxy_ip = expect
+    resp.core_config.tproxy_ip_ok = (tproxy == expect)
     local acc_mode = conf_raw:match('"acc_mode":(%d+)')
     resp.core_config.acc_mode = acc_mode or "not found"
     if acc_mode == "1" then
@@ -843,6 +1343,54 @@ function get_debug_status()
   else
     resp.network.gameacc_exists = false
     resp.network.gameacc_sample = "N/A"
+  end
+
+  -- === TPROXY policy routing ===
+  -- The engine marks intercepted packets with 0x99 and relies on
+  --   ip rule add fwmark 0x99 pref 99 lookup 99
+  --   ip route add local default dev lo table 99
+  -- to deliver them to the local proxy.  When either is missing the packets
+  -- are still marked by GAMEACC but fall through to the default route, which
+  -- looks exactly like "APP says accelerating but traffic is not proxied".
+  local rule_out = util.exec("ip rule show 2>/dev/null") or ""
+  resp.network.tproxy_rule = rule_out:find("fwmark 0x99", 1, true) ~= nil
+  local rt_out = util.exec("ip route show table 99 2>/dev/null") or ""
+  resp.network.tproxy_route = rt_out:find("local default dev lo", 1, true) ~= nil
+
+  -- Engine rule-injection failures (its own log wording)
+  local inject_fail = util.exec(
+    "grep -l -E 'add ip route failed|add ip routes failed|create tproxy common rules failed|create acc tproxy rules failed' /tmp/acc/log/*.log 2>/dev/null | head -1") or ""
+  resp.network.tproxy_inject_failed = inject_fail ~= ""
+
+  -- === Acceleration tunnel health ===
+  -- The engine keeps a heartbeat to each relay server it may use; a missing
+  -- heartbeat means the tunnel is not up and nothing will be accelerated.
+  resp.tunnel = { servers = {}, ok = false, data_plane = false }
+  local tlog = "/tmp/acc/log/acc_Game.log"
+  if not fs.access(tlog) then tlog = "/tmp/acc/log/acc_acc.log" end
+  if fs.access(tlog) then
+    resp.tunnel.log = tlog
+    local out = util.exec("grep -a 'TunnelHeartBeat' " .. tlog .. " 2>/dev/null | tail -60") or ""
+    local seen = {}
+    for line in out:gmatch("[^\n]+") do
+      local ip, port, loss, avg = line:match(
+        "server%\([^)]*%\):([%d%.]+):(%d+).-lost_persent:(%d+)%-*.-average_delay:(%d+)")
+      if not avg then
+        ip, port, loss = line:match("server%\([^)]*%\):([%d%.]+):(%d+).-lost_persent:(%d+)")
+      end
+      local addr = ip and (ip .. ":" .. port) or nil
+      if addr and not seen[addr] then
+        seen[addr] = true
+        resp.tunnel.servers[#resp.tunnel.servers + 1] = {
+          addr = addr,
+          loss = tonumber(loss) or 0,
+          delay = tonumber(avg) or 0
+        }
+      end
+    end
+    resp.tunnel.ok = #resp.tunnel.servers > 0
+    local s5 = util.exec("grep -ac 'S5 UDP' " .. tlog .. " 2>/dev/null") or "0"
+    resp.tunnel.data_plane = (tonumber(s5:match("%d+")) or 0) > 0
   end
 
   -- === Latency Diagnostics ===
@@ -905,13 +1453,28 @@ function get_debug_status()
     ["kmod-tun"]        = "kmod-tun",
     ["tc-full"]         = "tc-full",
     ["conntrack"]       = "conntrack",
-    ["libpcap"]         = "libpcap",
-    ["luci-compat"]     = "luci-compat"
+    ["libpcap1"]        = "libpcap1",
+    ["luci-compat"]     = "luci-compat",
+    ["luci-lua-runtime"] = "luci-lua-runtime"
   }
   resp.packages = {}
+  -- Package names differ between opkg (<=24.10) and apk (>=25.12);
+  -- probe both so the diagnostics page works on either backend.
+  local function pkg_installed_lua(pkg)
+    local alt = pkg
+    if pkg == "libpcap1" then alt = "libpcap" end
+    for _, cand in ipairs({ pkg, alt }) do
+      if util.exec("apk info -e '" .. cand .. "' >/dev/null 2>&1 && echo yes || echo no"):match("yes") then
+        return true
+      end
+      if util.exec("opkg list-installed 2>/dev/null | grep -q '^" .. cand .. " ' && echo yes || echo no"):match("yes") then
+        return true
+      end
+    end
+    return false
+  end
   for name, pkg in pairs(pkg_check) do
-    local installed = util.exec("opkg list-installed 2>/dev/null | grep -q '^" .. pkg .. " ' && echo yes || echo no")
-    resp.packages[name] = installed:match("yes") ~= nil
+    resp.packages[name] = pkg_installed_lua(pkg)
   end
 
   -- === Devices ===
@@ -991,7 +1554,9 @@ function get_debug_status()
     for _, lf in ipairs(log_files) do
       local path = log_dir .. lf
       if fs.access(path) then
-        local content = util.exec("grep -iE 'error|fail|fatal|crash|wrong|invalid|exit|refused' " .. path .. " 2>/dev/null | tail -5") or ""
+        -- Only real ERROR/WARN lines: "child process exit ... INFO" is routine
+        local content = util.exec("tail -n 200 " .. path ..
+          " 2>/dev/null | grep -E ' (ERROR|WARN|FATAL) ' | grep -v -E 'acc_objs is empty|delete iptables rule failed|delete rule failed|unknow acc mode|acceleration is empty|log report switch failed|router_log_report_config' | tail -5") or ""
         if content ~= "" and content ~= "\n" then
           for line in content:gmatch("[^\n]+") do
             resp.error_logs[#resp.error_logs + 1] = { file = lf, line = line }
@@ -999,6 +1564,33 @@ function get_debug_status()
         end
       end
     end
+  end
+
+  -- === Web child crash loop ===
+  -- New engines fork `-r web` and, when it cannot start (e.g. it fails to pull
+  -- the global config from opapi.xxghh.biz), it exits and is reforked ~5s.
+  -- acc_daemon.log then repeats "child process exit, ... status:0".
+  local loop_n = util.exec("tail -60 /tmp/acc/log/acc_daemon.log 2>/dev/null | grep -c 'child process exit'") or "0"
+  resp.web_loop_count = tonumber(loop_n:match("%d+")) or 0
+
+  -- === acc_firewall.ini (authoritative on 25.12 builds) ===
+  resp.firewall_ini = { exists = fs.access("/etc/config/acc_firewall.ini") }
+  if resp.firewall_ini.exists then
+    for line in io.lines("/etc/config/acc_firewall.ini") do
+      local k, v = line:match("^([%w_]+)=(.*)$")
+      if k == "backend" then
+        resp.firewall_ini.backend = v
+      elseif k == "mode" then
+        resp.firewall_ini.mode = v
+      elseif k == "tproxy_ip" then
+        resp.firewall_ini.tproxy_ip = v
+      end
+    end
+    -- Vendor sentinel per backend (see lib/setup.sh get_tproxy_ip_by_backend)
+    local want = "10.20.30.40"
+    if resp.firewall_ini.backend == "nftables" then want = "0.0.0.0" end
+    resp.firewall_ini.expected_tproxy_ip = want
+    resp.firewall_ini.tproxy_sentinel_ok = (resp.firewall_ini.tproxy_ip == want)
   end
 
   -- ============================================================
@@ -1022,7 +1614,8 @@ function get_debug_status()
   end
 
   -- Mode consistency: is the process actually running in the mode the init script specifies?
-  if resp.process.running and resp.init_script.short_format then
+  if resp.process.running and resp.init_script.short_format
+     and not resp.init_script.template_mode then
     local init_mode = resp.init_script.mode_flag:match("%-m (%S+)")
     if init_mode and pid_mode and init_mode ~= pid_mode then
       issue("warning", "Mode mismatch: init script specifies " .. init_mode .. " but process is running as " .. pid_mode .. ". Try restarting the service (menu option 5).")
@@ -1148,14 +1741,14 @@ function get_debug_status()
   -- Core config: tproxy_ip correctness
   if resp.core_config.exists then
     if resp.core_config.tproxy_ip_ok then
-      check("acc_core_conf.json tproxy_ip matches LAN IP", true)
+      check("acc_core_conf.json tproxy_ip matches configured target", true)
     else
       if pid_mode == "tproxy" then
-        issue("error", "acc_core_conf.json tproxy_ip (" .. resp.core_config.tproxy_ip .. ") does NOT match LAN IP (" .. resp.system.lan_ip .. "). The web subprocess will CRASH (exit 255) and phone APP cannot communicate. Run 'leigod-fw4.sh fix-config' to auto-fix.")
-        check("acc_core_conf.json tproxy_ip matches LAN IP", false, "error")
+        issue("error", "acc_core_conf.json tproxy_ip (" .. tostring(resp.core_config.tproxy_ip) .. ") does not match the configured target (" .. tostring(resp.core_config.expected_tproxy_ip) .. "). The web subprocess may crash-loop and the phone APP cannot communicate. Run 'leigod-fw4.sh fix-tproxy' to align it.")
+        check("acc_core_conf.json tproxy_ip matches configured target", false, "error")
       else
-        issue("warning", "acc_core_conf.json tproxy_ip (" .. resp.core_config.tproxy_ip .. ") does not match LAN IP (" .. resp.system.lan_ip .. "). In TUN mode this may not matter, but if you switch to TPROXY it will break.")
-        check("acc_core_conf.json tproxy_ip matches LAN IP", false, "warning")
+        issue("warning", "acc_core_conf.json tproxy_ip (" .. tostring(resp.core_config.tproxy_ip) .. ") does not match the configured target (" .. tostring(resp.core_config.expected_tproxy_ip) .. ").")
+        check("acc_core_conf.json tproxy_ip matches configured target", false, "warning")
       end
     end
 
@@ -1186,6 +1779,70 @@ function get_debug_status()
     check("Leigod API webapi.leigod.com is reachable", false, "error")
   end
 
+  -- CDN resolution + routing table (why "tunnel up but nothing accelerated")
+  if resp.process.running and pid_mode == "tproxy" then
+    if resp.cdn.dfs_resolvable then
+      check("引擎 CDN 域名本机可解析 (dfs01.nn.com)", true)
+    else
+      issue("error", "本机无法解析 dfs01.nn.com：引擎下载不到分流表 (cidrs.txt / cidrs_direct.txt / mac.json)，隧道会空转、游戏不会被加速。处理: 管理器菜单 D 写入 DNS 兜底，然后 /etc/init.d/acc restart。")
+      check("引擎 CDN 域名本机可解析 (dfs01.nn.com)", false, "error")
+    end
+
+    if resp.cdn.direct_cidrs > 0 then
+      check("分流表已加载 (direct_Game 有 " .. resp.cdn.direct_cidrs .. " 条)", true)
+    else
+      issue("warning", "direct_Game 集合为空：引擎尚未加载直连网段。若刚点加速请稍等再看；持续为空说明分流表没有下载成功（见上一条）。")
+      check("分流表已加载 (direct_Game 非空)", false, "warning")
+    end
+  end
+
+  -- Tunnel heartbeat: without it nothing is accelerated at all
+  if resp.process.running and pid_mode == "tproxy" then
+    if resp.tunnel and resp.tunnel.ok then
+      local best, best_delay = nil, nil
+      for _, s in ipairs(resp.tunnel.servers) do
+        if s.delay and (not best_delay or s.delay < best_delay) then
+          best, best_delay = s, s.delay
+        end
+      end
+      check("加速隧道心跳正常 (" .. (best and best.addr or "?") .. " / " ..
+            tostring(best_delay or "?") .. "ms)", true)
+    else
+      issue("warning", "未检测到加速隧道心跳 (acc_Game.log 内无 TunnelHeartBeat)。隧道未建立时流量不会被转发，请查看该日志。")
+      check("加速隧道心跳正常", false, "warning")
+    end
+  end
+
+  -- === Engine CDN resolution / routing-table availability ===
+  -- The engine downloads its routing data from dfs01.nn.com
+  -- (mac.json, cidrs.txt, cidrs_direct.txt). When the local resolver returns
+  -- only a CNAME (seen with dnsmasq behind MosDNS), every download fails with
+  -- "HTTP Status: 0", the tunnel carries only heartbeats and games are never
+  -- accelerated. Menu D (dns guard) pins IPv4 into /etc/hosts.
+  resp.cdn = { dfs_resolvable = false, direct_cidrs = 0 }
+  local cdn_ip = util.exec(
+    "nslookup dfs01.nn.com 2>/dev/null | awk '/^Address: *[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$/ {print $2; exit}'") or ""
+  resp.cdn.dfs_resolvable = (cdn_ip:match("^%d+%.%d+%.%d+%.%d+$") ~= nil)
+  local dg = util.exec("ipset list direct_Game 2>/dev/null | grep -c '^[0-9]'") or "0"
+  resp.cdn.direct_cidrs = tonumber(dg:match("%d+")) or 0
+
+  -- TPROXY policy routing (new engine: fwmark 0x99 -> table 99 -> local)
+  if resp.process.running and pid_mode == "tproxy" then
+    if resp.network.tproxy_inject_failed then
+      issue("error", "引擎报告加速规则注入失败 (日志含 'add ip routes failed' 或 'create tproxy rules failed')。表现为 APP 显示加速中但游戏流量未被代理。常见原因: ip 命令不可用/策略路由被其他代理插件覆盖/权限不足。")
+      check("加速规则注入成功", false, "error")
+    else
+      check("加速规则注入成功", true)
+    end
+
+    if resp.network.tproxy_rule and resp.network.tproxy_route then
+      check("TPROXY 策略路由 (fwmark 0x99 / table 99)", true)
+    else
+      issue("error", "TPROXY 策略路由缺失: ip rule 中没有 'fwmark 0x99' 或 table 99 中没有 'local default dev lo'。此时数据包会被标记却不会交付给代理进程 → 加速看起来成功但出口 IP 不变。")
+      check("TPROXY 策略路由 (fwmark 0x99 / table 99)", false, "error")
+    end
+  end
+
   -- GAMEACC chain
   if resp.network.gameacc_exists then
     check("GAMEACC iptables chain exists", true)
@@ -1208,9 +1865,29 @@ function get_debug_status()
     check("acc-gw internal logs are error-free", true)
   end
 
-  -- Web subprocess crash detection (exit 255 pattern)
-  if resp.core_config.exists and pid_mode == "tproxy" and not resp.core_config.tproxy_ip_ok then
-    issue("error", "Web subprocess crash loop expected: tproxy_ip mismatch. The web process exits with code 255 every ~8 seconds, consuming CPU and preventing phone APP communication. FIX: set tproxy_ip to " .. resp.system.lan_ip .. " in /tmp/acc/acc_core_conf.json and restart.")
+  -- Web child crash loop (new engine refork every ~5s, exit status 0)
+  if (resp.web_loop_count or 0) >= 3 then
+    issue("error", "检测到 web 子进程崩溃循环: 最近 60 行 acc_daemon.log 出现 " .. resp.web_loop_count .. " 次 'child process exit'。API 端口 5588 不会就绪，手机 APP 无法通信。请查看 /tmp/acc/log/web_api.log 中 start_web 的报错（常见: start global config manager failed = 拉取雷神全局配置失败）。")
+    check("web 子进程稳定 (未反复退出)", false, "error")
+  else
+    check("web 子进程稳定 (未反复退出)", true, "info")
+  end
+
+  -- acc_firewall.ini sanity (new layout only)
+  if resp.firewall_ini and resp.firewall_ini.exists then
+    if resp.firewall_ini.tproxy_sentinel_ok then
+      check("acc_firewall.ini tproxy_ip 符合 " .. tostring(resp.firewall_ini.backend) .. " 后端标准值", true)
+    else
+      issue("warning", "acc_firewall.ini tproxy_ip=" .. tostring(resp.firewall_ini.tproxy_ip) .. "，该后端标准值为 " .. tostring(resp.firewall_ini.expected_tproxy_ip) .. "。执行 leigod-fw4.sh fix-tproxy 可自动校正。")
+      check("acc_firewall.ini tproxy_ip 符合后端标准值", false, "warning")
+    end
+  end
+
+  -- Legacy only: tproxy_ip != LAN IP causes an exit-255 crash loop
+  if not (resp.firewall_ini and resp.firewall_ini.exists)
+     and resp.core_config.exists and pid_mode == "tproxy"
+     and not resp.core_config.tproxy_ip_ok then
+    issue("error", "旧版引擎: tproxy_ip 与 LAN IP 不一致会让 web 子进程以 255 退出。运行 leigod-fw4.sh fix-tproxy 修复。")
   end
 
   luci.http.prepare_content("application/json")
@@ -1260,8 +1937,26 @@ function get_debug_report()
     local pid = ps_raw:match("^(%d+)") or "N/A"
     w("  PID:         " .. pid)
   end
-  local ss = util.exec("ss -tlnp 2>/dev/null | grep 5588") or ""
-  w("  Port 5588:   " .. yn(ss ~= ""))
+  -- Port 5588 via /proc/net/tcp (no `ss` on iStoreOS 25.12)
+  local function port_listen_rep(port)
+    local hex = string.format("%04X", port)
+    local f, line
+    for _, p in ipairs({ "/proc/net/tcp", "/proc/net/tcp6" }) do
+      f = io.open(p, "r")
+      if f then
+        for line in f:lines() do
+          local addr, st = line:match("^%s*%d+:%s*(%S+)%s+%S+%s+(%S+)")
+          if st == "0A" and addr and #addr >= #hex and addr:sub(-#hex) == hex then
+            f:close()
+            return true
+          end
+        end
+        f:close()
+      end
+    end
+    return false
+  end
+  w("  Port 5588:   " .. yn(port_listen_rep(5588)))
 
   -- Init script
   local init_exists = fs.access("/etc/init.d/acc")
@@ -1275,6 +1970,7 @@ function get_debug_report()
     end
     w("  Args:        " .. args_line)
     local has_short = args_line:match("%-m tun") or args_line:match("%-m tproxy")
+                    or args_line:find("-m ${mode}", 1, true)
     w("  Short fmt:   " .. yn(has_short ~= nil))
     local has_port = args_line:match("%-p %d+")
     w("  Has port:    " .. yn(has_port ~= nil))
@@ -1290,7 +1986,19 @@ function get_debug_report()
     for line in io.lines("/tmp/acc/acc_core_conf.json") do conf_raw = conf_raw .. line end
     local tproxy_ip = conf_raw:match('"tproxy_ip":"([^"]*)"') or "not found"
     local lan_ip = uci:get("network","lan","ipaddr") or ""
-    w("  tproxy_ip:   " .. tproxy_ip .. " (LAN: " .. lan_ip .. ") [" .. ok(tproxy_ip == lan_ip) .. "]")
+    -- New layout: the INI sentinel is authoritative; legacy: LAN IP
+    local ini_ip = ""
+    if fs.access("/etc/config/acc_firewall.ini") then
+      for line in io.lines("/etc/config/acc_firewall.ini") do
+        local v = line:match("^tproxy_ip=(.*)$")
+        if v then ini_ip = v end
+      end
+    end
+    if ini_ip ~= "" then
+      w("  tproxy_ip:   " .. tproxy_ip .. " (INI: " .. ini_ip .. ") [" .. ok(tproxy_ip == ini_ip) .. "]")
+    else
+      w("  tproxy_ip:   " .. tproxy_ip .. " (LAN: " .. lan_ip .. ") [" .. ok(tproxy_ip == lan_ip) .. "]")
+    end
     local acc_mode = conf_raw:match('"acc_mode":(%d+)') or "not found"
     local mode_name = acc_mode == "1" and "TUN" or (acc_mode == "2" and "TPROXY" or "UNKNOWN")
     w("  acc_mode:    " .. mode_name .. " (" .. acc_mode .. ")")
@@ -1316,9 +2024,21 @@ function get_debug_report()
   -- Packages
   w("")
   w("--- Critical Packages ---")
-  for _, pkg in ipairs({"iptables-nft","kmod-nft-nat","kmod-nft-tproxy","kmod-tun","tc-full","conntrack","libpcap","luci-compat"}) do
-    local inst = util.exec("opkg list-installed 2>/dev/null | grep -q '^" .. pkg .. " ' && echo yes || echo no"):match("yes") ~= nil
-    w("  " .. pkg .. ": " .. string.rep(" ", 18 - #pkg) .. yn(inst))
+  local function pkg_ok_lua(pkg)
+    local alt = (pkg == "libpcap") and "libpcap1" or ((pkg == "libpcap1") and "libpcap" or pkg)
+    for _, cand in ipairs({ pkg, alt }) do
+      if util.exec("apk info -e '" .. cand .. "' >/dev/null 2>&1 && echo yes || echo no"):match("yes") then
+        return true
+      end
+      if util.exec("opkg list-installed 2>/dev/null | grep -q '^" .. cand .. " ' && echo yes || echo no"):match("yes") then
+        return true
+      end
+    end
+    return false
+  end
+  for _, pkg in ipairs({"iptables-nft","kmod-nft-nat","kmod-nft-tproxy","kmod-tun","tc-full","conntrack","libpcap1","luci-compat","luci-lua-runtime"}) do
+    local inst = pkg_ok_lua(pkg)
+    w("  " .. pkg .. ": " .. string.rep(" ", 20 - #pkg) .. yn(inst))
   end
 
   -- Devices
@@ -1369,7 +2089,9 @@ function get_debug_report()
     for _, lf in ipairs({"acc_daemon.log","acc_web.log","acc_acc.log"}) do
       local path = log_dir .. lf
       if fs.access(path) then
-        local content = util.exec("grep -iE 'error|fail|fatal|crash|wrong|invalid|exit|refused' " .. path .. " 2>/dev/null | tail -5") or ""
+        -- Only real ERROR/WARN lines: "child process exit ... INFO" is routine
+        local content = util.exec("tail -n 200 " .. path ..
+          " 2>/dev/null | grep -E ' (ERROR|WARN|FATAL) ' | grep -v -E 'acc_objs is empty|delete iptables rule failed|delete rule failed|unknow acc mode|acceleration is empty|log report switch failed|router_log_report_config' | tail -5") or ""
         if content ~= "" and content ~= "\n" then
           found_errors = true
           w("  [" .. lf .. "]")
@@ -1504,12 +2226,12 @@ local fw_type = "iptables (fw3)"
 local fw_recommend = ""
 if fs.access("/usr/sbin/fw4") or fs.access("/usr/sbin/nft") then
     fw_type = "nftables (fw4)"
-    fw_recommend = "检测到 fw4: 请确保 acc_core_conf.json 中 tproxy_ip 为路由器 LAN IP。如加速失败请运行诊断。"
+    fw_recommend = "检测到 fw4: 实际加速参数保存在 /etc/config/acc_firewall.ini (backend/mode/tproxy_ip)。如加速失败请运行诊断。"
 end
 
 m = Map("accelerator")
 m.title = "雷神加速器配置"
-m.description = "控制加速器设置"
+m.description = "控制加速器设置。注意: v1.2.2.x 引擎的设备加速由手机 APP 通过 5588 接口下发，本页的 UCI 开关可能不生效；切换 TUN/TPROXY 请用管理器菜单 5 或直接修改 acc_firewall.ini 的 mode 字段。"
 
 -- Firewall info (read-only, fw4 adapted)
 s = m:section(TypedSection, "system")
@@ -2194,16 +2916,18 @@ HTMEOF
   <p>
     插件运行需要借助一些依赖才能运行, 一般第三方固件默认已经集成了大部分的依赖, <br>
     如果使用的是openwrt官方的固件, 则需要确保依赖安装好了, 以下列出依赖包和注意事项 <br>
-    libpcap <br>
-    iptables <br>
-    kmod-ipt-nat <br>
-    iptables-mod-tproxy <br>
-    kmod-ipt-tproxy <br>
+    <b>OpenWrt 25.12 / iStoreOS 25.12 (apk)</b>: libpcap1, iptables-nft, kmod-nft-nat, kmod-nft-tproxy, kmod-tun, tc-full, ipset <br>
+    <b>OpenWrt 24.10 及更早 (opkg)</b>: libpcap, iptables, kmod-ipt-nat, iptables-mod-tproxy, kmod-ipt-tproxy, kmod-ipt-ipset, ipset <br>
     kmod-netem(非必须, 针对于一些icmp测速的游戏使用, 只影响界面显示, 实际游戏效果不影响) <br>
     tc-full(非必须, 同kmod-netem) <br>
-    kmod-ipt-ipset <br>
-    ipset <br>
     curl(谨慎更新, 某些三方固件升级curl, 会导致curl出现问题) <br>
+  </p>
+  <legend>LuCI 兼容层 (重要)</legend>
+  <p>
+    OpenWrt 25.12 起 LuCI 调度器改为 ucode, 本插件的网页界面为 Lua CBI, <br>
+    必须安装 luci-compat 与 luci-lua-runtime 才能被加载, 缺失时菜单不会出现, <br>
+    访问地址会提示 404 "No page is registered at ..." <br>
+    安装命令: apk add luci-compat luci-lua-runtime <br>
   </p>
   <legend>网桥模式</legend>
   <p>
@@ -2438,7 +3162,8 @@ HTMEOF
         cp -r "$patch_dir/luasrc"/* "$luci_src/"
         echo "[INFO] LuCI fw4 适配补丁已应用 (from $patch_dir)"
     fi
-    rm -rf /tmp/luci-*
+    rm -f /tmp/luci-indexcache* 2>/dev/null; rm -rf /tmp/luci-modulecache 2>/dev/null
+    /etc/init.d/rpcd restart >/dev/null 2>&1
     echo "[INFO] LuCI 缓存已清除，刷新 Web 页面即可看到更新"
 }
 leigod_menu() {
@@ -2446,6 +3171,7 @@ leigod_menu() {
     echo "============================="
     echo "OpenWrt LeigodAcc Manager"
     echo "防火墙: $FW_NAME"
+    echo "包管理: $(pkg_mgr_name)"
     echo
     echo "1. 安装"
     echo "2. 卸载"
@@ -2459,6 +3185,8 @@ leigod_menu() {
     echo "S. 查看服务状态   (诊断)"
     echo "L. 延迟波动诊断   (bufferbloat/QoS)"
     echo "T. 内核网络调优   (低延迟优化)"
+    echo "D. DNS 兜底       (引擎分流表下载)"
+    echo "U. 自动升级 开/关 (防错架构包)"
     echo "H. 反馈/帮助"
     echo "0. 退出"
     echo "============================="
@@ -2480,24 +3208,11 @@ install_leigodacc() {
                 ;;
         esac
     fi
-    if [ -f /etc/catwrt_release ]; then
-        if ! grep -q -E "catwrt|repo.miaoer.xyz" /etc/opkg/distfeeds.conf; then
-            echo "[ERROR] 检测到 CatWrt，请先配置 CatWrt 软件源，请使用:"
-            echo "Cattools - Apply_repo"
-            echo
-            echo "在正确启用软件源后即可获取雷神加速器插件完整支持(可能)"
-            cattools
-            return
-        fi
-    else
-        [ -f /etc/opkg/customfeeds.conf ] && { echo "[customfeeds.conf]"; cat /etc/opkg/customfeeds.conf; } || echo "[INFO] customfeeds.conf 不存在"
-        [ -f /etc/opkg/distfeeds.conf ] && { echo "[distfeeds.conf]"; cat /etc/opkg/distfeeds.conf; } || echo "[INFO] distfeeds.conf 不存在"
-        if [ ! -f /usr/bin/cattools ]; then
-            echo "[AD] 你还没有安装 Cattools 以方便安装 LeigodAcc 中依赖部分缺少的组件"
-            echo "请查看 https://github.com/miaoermua/cattools 或使用"
-            echo "推荐 CatWrt 最新版 https://www.miaoer.net/network/catwrt"
-            echo ""
-        fi
+    echo "[INFO] 包管理器: $(pkg_mgr_name)"
+    pkg_show_feeds
+    if [ "$PKG_MGR" = "none" ]; then
+        echo "[ERROR] 未检测到 apk / opkg，无法安装依赖包"
+        return 1
     fi
     release_info=$(cat /etc/openwrt_release)
     if echo "$release_info" | grep -qE "iStoreOS|QWRT|ImmortalWrt|LEDE"; then
@@ -2506,7 +3221,7 @@ install_leigodacc() {
     if ! check_disk_space; then
         return 1
     fi
-    if [ -e /var/lock/opkg.lock ]; then
+    if [ -e /var/lock/opkg.lock ] && [ "$PKG_MGR" = "opkg" ]; then
         if pgrep -x "opkg" > /dev/null 2>&1; then
             echo "[WARN] 检测到其他 opkg 进程正在运行，等待完成 (最多30秒)..."
             local _i=0
@@ -2522,54 +3237,65 @@ install_leigodacc() {
         fi
     fi
     if ! check_network; then
-        echo "[WARN] 网络不可达，后续 opkg update 及下载可能会失败"
+        echo "[WARN] 网络不可达，后续依赖安装及下载可能会失败"
         echo -n "是否继续? (y/n): "
         read proceed
         [ "$proceed" != "y" ] && [ "$proceed" != "Y" ] && return
     fi
     echo "[INFO] 安装必备组件 (防火墙: $FW_NAME)..."
-    OPKG_FAILED=""
+    PKG_FAILED=""
     for pkg in $(get_essential_packages); do
-        if ! opkg list-installed | grep -q "$pkg"; then
-            safe_opkg_install "$pkg"
-        else
+        if pkg_installed "$pkg"; then
             echo "[INFO] $pkg 必备组件已安装，跳过"
+        else
+            safe_pkg_install "$pkg"
         fi
     done
     echo "[INFO] 安装增强组件..."
     for pkg in $(get_optional_packages); do
-        if ! opkg list-installed | grep -q "$pkg"; then
-            safe_opkg_install "$pkg"
-        else
+        if pkg_installed "$pkg"; then
             echo "[INFO] $pkg 已安装，跳过"
+        else
+            safe_pkg_install "$pkg"
         fi
     done
     if ! ensure_fw4_tproxy; then
         echo "[WARN] TPROXY 不可用。注意: 部分 acc-gw 版本仅支持 TPROXY，此情况下加速将无法工作"
     fi
     setup_fw4_integration
-    if [ -d /usr/lib/lua/luci/controller ]; then
-        if ! opkg list-installed 2>/dev/null | grep -q "^luci-compat"; then
-            echo "[INFO] 安装 luci-compat (LuCI Lua CBI 兼容层)..."
-            safe_opkg_install luci-compat
-        fi
+    if ! pkg_installed "luci-compat"; then
+        echo "[INFO] 安装 luci-compat (LuCI Lua CBI 兼容层)..."
+        safe_pkg_install luci-compat
+    fi
+    if ! pkg_installed "luci-lua-runtime"; then
+        echo "[INFO] 安装 luci-lua-runtime (Lua 调度运行时)..."
+        safe_pkg_install luci-lua-runtime
+    fi
+    if [ -d /usr/lib/lua/luci ]; then
         apply_luci_fw4_patch
-    fi
-    if ! opkg list-installed | grep -q 'luci-app-upnp'; then
-        safe_opkg_install luci-app-upnp
-    fi
-    if [ -f /etc/config/upnpd ]; then
-        echo "[INFO] 正在启用 UPnP..."
-        uci set upnpd.config.enabled='1'
-        uci commit upnpd
-        /etc/init.d/miniupnpd start
-        /etc/init.d/miniupnpd enable
-        echo "[INFO] UPnP 已启用并运行"
-        echo "安装成功后可以在雷神加速器 APP 发现并绑定设备"
-        echo
     else
-        echo "[ERROR] UPnP 配置不存在，安装可能失败，请检查固件!"
-        return 1
+        echo "[WARN] /usr/lib/lua/luci 不存在，LuCI 页面无法部署 (缺少 luci-lua-runtime)"
+    fi
+    if ! pkg_installed "$PKG_LUCI_UPNP"; then
+        safe_pkg_install "$PKG_LUCI_UPNP"
+    fi
+    if ensure_upnpd; then
+        if [ -f /etc/config/upnpd ]; then
+            echo "[INFO] 正在启用 UPnP..."
+            uci set upnpd.config.enabled='1' 2>/dev/null
+            uci commit upnpd 2>/dev/null
+            /etc/init.d/miniupnpd enable >/dev/null 2>&1
+            /etc/init.d/miniupnpd restart >/dev/null 2>&1
+            echo "[INFO] UPnP 已启用并运行"
+            echo "安装成功后可以在雷神加速器 APP 发现并绑定设备"
+            echo
+        else
+            echo "[WARN] $PKG_UPNP 已安装但 /etc/config/upnpd 不存在，跳过 UPnP 启用"
+            echo "[WARN] 手机 APP 可能无法通过 SSDP 发现路由器"
+        fi
+    else
+        echo "[WARN] UPnP 服务不可用 ($PKG_UPNP)，继续安装但不启用 UPnP"
+        echo "[WARN] 手机 APP 可能无法发现路由器；可稍后手动安装 $PKG_LUCI_UPNP"
     fi
     echo "[INFO] 下面是雷神官方提供的脚本,打印内容偏长如遇到问题请提供输出内容(截图/文字)反馈到群里."
     install_script=$(curl -fsSL --connect-timeout 10 --max-time 60 \
@@ -2580,7 +3306,17 @@ install_leigodacc() {
         echo "[ERROR] 无法下载雷神官方安装脚本！请检查网络或雷神服务器状态"
         return 1
     fi
-    cd /tmp && echo "$install_script" | sh
+    install_opkg_shim
+    _old_path="$PATH"
+    case "$PKG_MGR" in
+        apk) PATH="$APK_SHIM_DIR:$PATH" ;;
+    esac
+    ( cd /tmp && printf '%s\n' "$install_script" | sh )
+    _install_rc=$?
+    PATH="$_old_path"
+    if [ "$_install_rc" != "0" ]; then
+        echo "[WARN] 官方安装脚本返回非零状态 ($_install_rc)，继续做后续检查"
+    fi
     if [ ! -d /usr/sbin/leigod ]; then
         echo "[ERROR] 检测到 LeigodAcc 未安装，有可能是设备存储空间已满或者雷神服务器挂了!"
         echo "请登录 OpenWrt 路由器后台: 系统-软件包 查看当前可用空间诊断."
@@ -2595,44 +3331,59 @@ install_leigodacc() {
             echo "[INFO] 已修正加速模式参数格式 (--mode tproxy → -m tproxy)"
         fi
         setup_iptables_nft_compat
-        if [ "$FW_TYPE" = "fw4" ]; then
-            apply_luci_fw4_patch
-            local luci_missing=""
-            for f in /usr/lib/lua/luci/controller/acc.lua \
-                     /usr/lib/lua/luci/model/cbi/leigod/service.lua \
-                     /usr/lib/lua/luci/model/cbi/leigod/device.lua \
-                     /usr/lib/lua/luci/model/cbi/leigod/autopause.lua \
-                     /usr/lib/lua/luci/view/leigod/debug.htm; do
-                [ ! -f "$f" ] && luci_missing="$luci_missing  $f\n"
-            done
-            if [ -n "$luci_missing" ]; then
-                echo "[WARN] LuCI 文件缺失! 可能是补丁目录未上传或内联写入失败:"
-                printf "$luci_missing"
-                echo "[INFO] 请确保 luci-fw4-patch/ 目录已上传到 /tmp/ 或 /root/"
-                echo "[INFO] 或手动运行: leigod-fw4.sh 内联补丁将自动写入"
-            else
-                echo "[INFO] LuCI fw4 适配文件完整性验证: 通过"
-            fi
+        apply_luci_fw4_patch
+        local luci_missing=""
+        for f in /usr/lib/lua/luci/controller/acc.lua \
+                 /usr/lib/lua/luci/model/cbi/leigod/service.lua \
+                 /usr/lib/lua/luci/model/cbi/leigod/device.lua \
+                 /usr/lib/lua/luci/model/cbi/leigod/autopause.lua \
+                 /usr/lib/lua/luci/view/leigod/debug.htm; do
+            [ ! -f "$f" ] && luci_missing="$luci_missing  $f\n"
+        done
+        if [ -n "$luci_missing" ]; then
+            echo "[WARN] LuCI 文件缺失! 可能是补丁目录未上传或内联写入失败:"
+            printf "$luci_missing"
+            echo "[INFO] 请确保 luci-fw4-patch/ 目录已上传到 /tmp/ 或 /root/"
+            echo "[INFO] 或手动运行: leigod-fw4.sh 内联补丁将自动写入"
+        else
+            echo "[INFO] LuCI fw4 适配文件完整性验证: 通过"
         fi
+        rm -f /tmp/luci-indexcache* 2>/dev/null; rm -rf /tmp/luci-modulecache 2>/dev/null
+        /etc/init.d/rpcd restart >/dev/null 2>&1
+        /etc/init.d/uhttpd restart >/dev/null 2>&1
         install_tproxy_watcher
+        if [ -f /tmp/acc/upgrade_flag ]; then
+            rm -f /tmp/acc/upgrade_flag
+            echo "[INFO] 已清理残留的升级标志 /tmp/acc/upgrade_flag"
+        fi
+        fix_acc_core_conf
+        acc_health_check
+        if [ -z "$(dns_resolve_ipv4 dfs01.nn.com)" ]; then
+            echo "[WARN] 本机无法解析 dfs01.nn.com —— 引擎下载不到分流表，加速不会生效"
+            echo "[WARN] 运行菜单 D (DNS 兜底) 固定 IPv4 后执行 /etc/init.d/acc restart"
+        fi
         echo ""
         echo "=========================================="
         echo "  [提示] LuCI 网页管理 & 加速模式"
         echo "=========================================="
         if [ -f /usr/lib/lua/luci/controller/acc.lua ]; then
             echo "  LuCI 网页界面: 已就绪"
-            echo "  可通过路由器 Web 后台 → 服务 → Leigod Acc 访问"
+            echo "  可通过路由器 Web 后台 → 服务 → 雷神加速器 访问"
         else
-            echo "  LuCI 网页界面: 未安装"
-            echo "  如需要 Web 后台管理，请使用菜单选项 8"
-            echo "  安装 Lean IPKG 版 (含 luci-app-leigod-acc)"
+            echo "  LuCI 网页界面: 未安装 (缺少 /usr/lib/lua/luci/controller/acc.lua)"
+            echo "  请检查 luci-compat / luci-lua-runtime 是否安装"
+        fi
+        if [ -e /var/run/docker.sock ] || [ -e /run/docker.sock ] || \
+           { command -v ip >/dev/null 2>&1 && ip -4 addr show docker0 >/dev/null 2>&1; }; then
+            echo "  [注意] 检测到 Docker 网桥 (172.17.0.0/16)"
+            echo "         该网段不在 acc-gw 默认直连列表中，如容器流量异常可先暂停加速测试"
         fi
         echo "=========================================="
         echo ""
     fi
     echo "[INFO] 正在执行安装后检查..."
     for pkg in $(get_check_packages); do
-        if ! opkg list-installed | grep -q "$pkg"; then
+        if ! pkg_installed "$pkg"; then
             echo "[WARN] 缺少组件包: $pkg"
             echo "[INFO] 你可以通过管理器中的安装依赖性组件进行补充!"
         fi
@@ -2664,7 +3415,7 @@ install_leigodacc() {
         esac
         echo ""
     fi
-    if [ -d /usr/lib/lua/luci/controller ]; then
+    if [ -d /usr/lib/lua/luci ]; then
         verify_luci
     fi
 }
@@ -2672,16 +3423,21 @@ install_compatibility_dependencies() {
     if ! check_disk_space; then
         return 1
     fi
-    arch=$(opkg print-architecture | grep "arch" | awk '{print $2}' | grep -vE "all|noarch" | head -1)
+    arch=$(pkg_arch)
     if [ -z "$arch" ]; then
         echo "[ERROR] 无法确定系统架构"
         return
     fi
+    echo "[INFO] 系统架构: $arch / 包管理器: $(pkg_mgr_name)"
     if [ "$FW_TYPE" = "fw4" ]; then
         echo "[INFO] fw4 系统，优先使用官方软件源安装兼容依赖..."
-        for pkg in tc-full conntrack conntrackd; do
-            if ! opkg list-installed | grep -q "$pkg"; then
-                safe_opkg_install "$pkg"
+        for pkg in tc-full conntrack conntrackd ipset; do
+            if ! pkg_available "$pkg"; then
+                echo "[INFO] $pkg 不在当前软件源中，跳过"
+                continue
+            fi
+            if ! pkg_installed "$pkg"; then
+                safe_pkg_install "$pkg"
             else
                 echo "[INFO] $pkg 已安装，跳过"
             fi
@@ -2691,7 +3447,7 @@ install_compatibility_dependencies() {
             echo "[WARN] TPROXY 不可用。注意: 部分 acc-gw 版本仅支持 TPROXY，此情况下加速将无法工作"
         fi
     fi
-    if [ "$FW_TYPE" != "fw4" ]; then
+    if [ "$PKG_MGR" = "opkg" ] && [ "$FW_TYPE" != "fw4" ]; then
     case "$arch" in
         x86_64)
             packages="tc-full conntrack conntrackd libnetfilter-cttimeout1 libnetfilter-cthelper0"
@@ -2750,43 +3506,50 @@ install_compatibility_dependencies() {
             ;;
     esac
     for pkg in $packages; do
-        if ! opkg list-installed | grep -q "$pkg"; then
-            safe_opkg_install "$pkg"
+        if ! pkg_installed "$pkg"; then
+            safe_pkg_install "$pkg"
         else
             echo "[INFO] $pkg 已安装，跳过"
         fi
     done
     for pkg in $packages; do
-        if ! opkg list-installed | grep -q "$pkg"; then
+        if ! pkg_installed "$pkg"; then
             echo "[INFO] $pkg 未在官方源中找到，尝试使用第三方源"
             echo "[INFO] 正在使用天灵 immortalwrt pku 的软件源，并不是原生支持的软件包可能会存在你所在的第三方固件源除外的问题"
             tmp_dir=$(mktemp -d)
             for url in $urls; do
                 wget -P "$tmp_dir" "$url"
             done
-            opkg install "$tmp_dir"/*.ipk
+            pkg_install_raw "$tmp_dir"/*.ipk
             rm -rf "$tmp_dir"
             break
         fi
     done
-    fi  # end fw3-only fallback block
+    fi  # end opkg/fw3-only fallback block
     for pkg in $(get_check_packages); do
-        if ! opkg list-installed | grep -q "$pkg"; then
+        if ! pkg_installed "$pkg"; then
             echo "[ERROR] 缺少包: $pkg"
-            if [ "$FW_TYPE" = "fw4" ]; then
-                echo "Tip: OpenWrt 24.10 使用 fw4 防火墙，请确保 opkg 软件源配置正确。"
-                echo "你可能需要检查 /etc/opkg/distfeeds.conf 是否包含正确的软件源。"
-            else
-                echo "Tip: 你可以到 immortalwrt 官网构建固件并勾选对应的组件替换掉当前系统,或者使用 CatWrt.v24.9 支持 LeigodAcc 全部依赖."
-                echo "https://www.miaoer.net/posts/network/catwrt"
-            fi
+            echo "Tip: 请检查软件源配置是否正确:"
+            case "$PKG_MGR" in
+                apk)  echo "     /etc/apk/repositories.d/*.list   (apk update 可刷新索引)" ;;
+                opkg) echo "     /etc/opkg/distfeeds.conf" ;;
+            esac
             echo
         fi
     done
 }
+leigod_installed() {
+    [ -d /usr/sbin/leigod ] && return 0
+    [ -f /etc/init.d/acc ] && return 0
+    [ -f /etc/config/accelerator ] && return 0
+    [ -f /etc/config/acc_firewall.ini ] && return 0
+    [ -f /usr/lib/lua/luci/controller/acc.lua ] && return 0
+    pkg_installed leigod-acc && return 0
+    return 1
+}
 uninstall_leigodacc() {
-    if [ ! -d /usr/sbin/leigod ]; then
-        echo "[ERROR] 雷神服务文件不存在，是不是还没安装捏."
+    if ! leigod_installed; then
+        echo "[ERROR] 未检测到雷神加速器插件或管理器文件，无需卸载"
         return
     fi
     echo "[INFO] 确定卸载? 输入数字后回车或 10s 后自动取消 ([1]确定 / [2]取消): "
@@ -2799,62 +3562,155 @@ uninstall_leigodacc() {
             return
             ;;
     esac
-    if opkg list-installed | grep -q "leigod-acc"; then
-        echo "[INFO] leigod-acc 通过 opkg 安装，正在卸载"
-        /etc/init.d/acc disable
-        /etc/init.d/acc stop
-        opkg remove luci-i18n-leigod-acc-zh-cn luci-app-leigod-acc leigod-acc
-        rm -rf /usr/lib/lua/luci/model/cbi/leigod
-        rm -rf /usr/lib/lua/luci/view/leigod
-        rm -rf /usr/sbin/leigod
-        rm -rf /tmp/luci-*
-        echo "[INFO] leigod-acc 卸载成功"
-    else
-        /etc/init.d/acc disable 2>/dev/null
-        /etc/init.d/acc stop 2>/dev/null
-        rm -f /etc/config/accelerator
-        rm -f /etc/init.d/acc
-        rm -f /usr/lib/lua/luci/controller/acc.lua
-        rm -rf /usr/lib/lua/luci/model/cbi/leigod
-        rm -rf /usr/lib/lua/luci/view/leigod
-        rm -rf /usr/sbin/leigod
-        rm -f /usr/lib/lua/luci/i18n/acc.zh-cn.lmo
-        rm -rf /tmp/luci-*
-        echo "[INFO] leigod-acc 卸载成功"
+    echo "[INFO] 开始卸载 LeigodAcc ..."
+    if [ -x /usr/sbin/leigod/leigod_uninstall.sh ]; then
+        echo "[INFO] 调用官方卸载脚本 leigod_uninstall.sh ..."
+        sh /usr/sbin/leigod/leigod_uninstall.sh </dev/null >/dev/null 2>&1 || \
+            echo "[WARN] 官方卸载脚本返回非零，继续手动清理"
     fi
-    iptables-nft -t mangle -F GAMEACC 2>/dev/null || iptables -t mangle -F GAMEACC 2>/dev/null
-    iptables-nft -t mangle -X GAMEACC 2>/dev/null || iptables -t mangle -X GAMEACC 2>/dev/null
-    iptables-nft -t mangle -D PREROUTING -j GAMEACC 2>/dev/null || \
-        iptables -t mangle -D PREROUTING -j GAMEACC 2>/dev/null
-    echo "[INFO] 已清理 iptables GAMEACC 规则"
-    if grep -q "LeigodAcc" /etc/config/firewall 2>/dev/null; then
-        fw_idx=$(uci show firewall | grep "LeigodAcc" | head -1 | cut -d. -f1-2)
-        if [ -n "$fw_idx" ]; then
-            uci delete "$fw_idx" 2>/dev/null
-            uci commit firewall 2>/dev/null
-            /etc/init.d/firewall restart >/dev/null 2>&1
-            echo "[INFO] 已清理防火墙 TCP 5588 规则"
-        fi
+    if [ -x /etc/init.d/acc ]; then
+        /etc/init.d/acc stop >/dev/null 2>&1
+        /etc/init.d/acc disable >/dev/null 2>&1
     fi
-    if [ "$FW_TYPE" = "fw4" ]; then
-        rm -f /etc/hotplug.d/firewall/99-leigodacc-restart
-        echo "[INFO] 已清理 fw4 防火墙集成文件"
+    for pat in "/usr/sbin/leigod/acc-gw" "acc_upgrade_monitor" "leigod/monitor.sh"; do
+        pids=$(pgrep -f "$pat" 2>/dev/null)
+        [ -n "$pids" ] && kill -9 $pids 2>/dev/null
+    done
+    echo "[INFO] 服务已停止 (残留进程已清理)"
+    if pkg_installed "leigod-acc"; then
+        echo "[INFO] 通过包管理器移除 leigod-acc 相关包 ..."
+        pkg_remove_raw luci-i18n-leigod-acc-zh-cn luci-app-leigod-acc leigod-acc >/dev/null 2>&1
     fi
-    if [ -L /usr/sbin/iptables ] && [ "$(readlink /usr/sbin/iptables 2>/dev/null)" = "iptables-nft" ]; then
-        rm -f /usr/sbin/iptables
-        echo "[INFO] 已清理 iptables-nft 符号链接"
-    fi
-    if [ -f /usr/sbin/leigod-auto-pause.sh ]; then
-        echo "[INFO] 检测到自动暂停组件，正在清理..."
+    rm -f /etc/config/accelerator \
+          /etc/config/leigod \
+          /etc/config/accelerator.ini \
+          /etc/config/acc_firewall.ini \
+          /etc/config/acc_version.ini \
+          /etc/config/acc_core_conf.json \
+          /etc/config/ipdatacloud_country.xdb \
+          /etc/config/upgrade_data.json \
+          /etc/config/accelerator.lock \
+          /etc/config/accelerator.ini.lock \
+          /etc/config/acc_firewall.ini.lock \
+          /etc/config/acc_version.ini.lock
+    echo "[INFO] 已清理引擎配置 (accelerator / accelerator.ini / acc_firewall.ini / acc_version.ini / *.xdb)"
+    rm -rf /tmp/acc
+    rm -rf /tmp/acc_install_lib
+    rm -f /tmp/acc-lib.tar.gz /tmp/acc-bundle-*.tar.gz \
+          /tmp/acc_domain_config_*.json /tmp/upgrade_data.json \
+          /tmp/leigod_acc_install.log /tmp/leigod_acc_init.log \
+          /tmp/leigod_acc_monitor.log /tmp/leigod-hotplug-restart.ts \
+          /tmp/acc_firewall.ini.bak 2>/dev/null
+    echo "[INFO] 已清理运行时文件 (/tmp/acc 等)"
+    rm -f /etc/init.d/acc
+    rm -rf /usr/sbin/leigod
+    echo "[INFO] 已删除服务脚本与安装目录 (/etc/init.d/acc, /usr/sbin/leigod)"
+    rm -f /usr/lib/lua/luci/controller/acc.lua \
+          /usr/lib/lua/luci/i18n/acc.zh-cn.lmo \
+          /usr/share/luci/menu.d/luci-app-leigod-acc.json \
+          /usr/share/rpcd/acl.d/luci-app-leigod-acc.json
+    rm -rf /usr/lib/lua/luci/model/cbi/leigod \
+           /usr/lib/lua/luci/view/leigod \
+           /www/luci-static/resources/view/leigodacc \
+           /www/luci-static/resources/view/leigod
+    echo "[INFO] 已删除 LuCI 页面文件 (12 个 Lua 文件 + 菜单/ACL 残留)"
+    if [ -f /etc/crontabs/root ]; then
         sed -i '/leigod-auto-pause/d' /etc/crontabs/root 2>/dev/null
-        sed -i '/leigod-fw4.sh fix-tproxy/d' /etc/crontabs/root 2>/dev/null
-        /etc/init.d/cron restart 2>/dev/null
-        rm -f /usr/sbin/leigod-auto-pause.sh
-        rm -f /etc/leigod-auto-pause.conf
-        rm -f /tmp/leigod-auto-pause.state
-        rm -f /tmp/leigod-auto-pause.log
-        echo "[INFO] 已清理自动暂停组件"
+        sed -i '/leigod-fw4\.sh/d' /etc/crontabs/root 2>/dev/null
+        sed -i '/\/usr\/sbin\/leigod\//d' /etc/crontabs/root 2>/dev/null
+        /etc/init.d/cron restart >/dev/null 2>&1
+        echo "[INFO] 已清理 crontab 中的雷神相关任务"
     fi
+    rm -f /usr/sbin/leigod-auto-pause.sh \
+          /etc/leigod-auto-pause.conf \
+          /tmp/leigod-auto-pause.state \
+          /tmp/leigod-auto-pause.log \
+          /tmp/leigod-away.logged
+    echo "[INFO] 已清理自动暂停组件"
+    local i=0
+    while [ "$i" -lt 5 ] && grep -q "LeigodAcc" /etc/config/firewall 2>/dev/null; do
+        fw_idx=$(uci show firewall 2>/dev/null | grep "LeigodAcc" | head -1 | cut -d. -f1-2)
+        case "$fw_idx" in
+            firewall.*) ;;
+            *) break ;;
+        esac
+        uci delete "$fw_idx" 2>/dev/null || break
+        i=$((i + 1))
+    done
+    if [ "$i" -gt 0 ]; then
+        uci commit firewall 2>/dev/null
+        echo "[INFO] 已移除防火墙规则 LeigodAcc (TCP 5588)"
+    fi
+    rm -f /etc/hotplug.d/firewall/99-leigodacc-restart
+    if command -v iptables >/dev/null 2>&1; then
+        for tbl in mangle filter nat; do
+            case "$tbl" in filter) built="INPUT" ;; *) built="PREROUTING" ;; esac
+            iptables -t "$tbl" -D "$built" -j GAMEACC 2>/dev/null
+            iptables -t "$tbl" -F GAMEACC 2>/dev/null
+            iptables -t "$tbl" -X GAMEACC 2>/dev/null
+        done
+        iptables -t filter -D INPUT -p tcp -m multiport --dports 5588 -j ACCEPT 2>/dev/null
+        iptables -t filter -D INPUT -p udp -m multiport --dports 6066 -j ACCEPT 2>/dev/null
+    fi
+    if command -v ipset >/dev/null 2>&1; then
+        for name in $(ipset list -n 2>/dev/null); do
+            case "$name" in
+                direct_*|target_*|proxy_*) ipset destroy "$name" 2>/dev/null ;;
+            esac
+        done
+    fi
+    command -v nft >/dev/null 2>&1 && nft delete table inet tproxy_table 2>/dev/null
+    echo "[INFO] 已清理加速规则 (GAMEACC 链 / ipset 集合 / nft 表)"
+    if [ -x /etc/init.d/firewall ]; then
+        /etc/init.d/firewall reload >/dev/null 2>&1
+    fi
+    if [ -L /usr/sbin/iptables ]; then
+        _ipt_tgt=$(readlink /usr/sbin/iptables 2>/dev/null)
+        case "$_ipt_tgt" in
+            *iptables-nft*)
+                if [ -x /usr/sbin/xtables-nft-multi ]; then
+                    ln -sf xtables-nft-multi /usr/sbin/iptables
+                    echo "[INFO] 已恢复 /usr/sbin/iptables -> xtables-nft-multi"
+                else
+                    rm -f /usr/sbin/iptables /usr/sbin/iptables-restore /usr/sbin/iptables-save
+                    echo "[WARN] iptables-nft 不可用，已移除兼容符号链接"
+                fi
+                ;;
+        esac
+    fi
+    remove_opkg_shim
+    rm -f /tmp/luci-indexcache* 2>/dev/null; rm -rf /tmp/luci-modulecache 2>/dev/null
+    /etc/init.d/rpcd restart >/dev/null 2>&1
+    /etc/init.d/uhttpd restart >/dev/null 2>&1
+    echo "[INFO] LuCI 缓存已清除，rpcd/uhttpd 已重启 (需要重新登录后台)"
+    leftovers=""
+    for f in /etc/config/accelerator /etc/config/accelerator.ini \
+             /etc/config/acc_firewall.ini /etc/config/acc_version.ini \
+             /etc/config/acc_core_conf.json /etc/config/ipdatacloud_country.xdb \
+             /etc/init.d/acc /usr/sbin/leigod-auto-pause.sh \
+             /etc/leigod-auto-pause.conf \
+             /etc/hotplug.d/firewall/99-leigodacc-restart \
+             /usr/lib/lua/luci/controller/acc.lua; do
+        [ -e "$f" ] && leftovers="$leftovers $f"
+    done
+    [ -d /usr/sbin/leigod ] && leftovers="$leftovers /usr/sbin/leigod"
+    [ -d /tmp/acc ] && leftovers="$leftovers /tmp/acc"
+    [ -d /usr/lib/lua/luci/model/cbi/leigod ] && leftovers="$leftovers /usr/lib/lua/luci/model/cbi/leigod"
+    [ -d /usr/lib/lua/luci/view/leigod ] && leftovers="$leftovers /usr/lib/lua/luci/view/leigod"
+    if grep -q 'leigod' /etc/crontabs/root 2>/dev/null; then
+        leftovers="$leftovers crontab(leigod)"
+    fi
+    echo ""
+    if [ -n "$leftovers" ]; then
+        echo "[WARN] 以下项目未能自动清理，请手动处理:"
+        for x in $leftovers; do echo "        $x"; done
+    else
+        echo "[OK] 卸载完成，未发现残留"
+    fi
+    echo "[INFO] 保留项（如需一并清除请手动处理）:"
+    echo "        /etc/config/upnpd      — 安装时启用的 UPnP 设置"
+    echo "        /etc/sysctl.d/99-leigod-latency.conf — 内核网络调优 (如执行过选项 T)"
+    echo "[INFO] 浏览器侧菜单缓存: 重新登录后台，或 Ctrl+Shift+R 强制刷新"
 }
 reinstall_leigodacc() {
     local cfg_backup=""
@@ -2909,22 +3765,29 @@ reinstall_leigodacc() {
     verify_luci
 }
 ensure_uci_config() {
-    lan_if=$(uci get network.lan.ifname 2>/dev/null | awk '{print $1}')
+    lan_if=$(uci get network.lan.ifname 2>/dev/null | awk '{print $1}' | head -1)
+    if [ -z "$lan_if" ]; then
+        lan_if=$(uci get network.lan.device 2>/dev/null)
+    fi
     [ -z "$lan_if" ] && lan_if="br-lan"
-    if ! uci get accelerator.base >/dev/null 2>&1; then
-        uci set accelerator.base=system
-        uci set accelerator.base.neigh="$lan_if"
+    if [ ! -f /etc/config/accelerator ]; then
+        printf '# Leigod accelerator (managed by leigod-fw4.sh)\n' > /etc/config/accelerator
+        echo "[INFO] 已创建 /etc/config/accelerator"
+    fi
+    if ! uci -q get accelerator.base >/dev/null 2>&1; then
+        uci set accelerator.base=system 2>/dev/null
+        uci set accelerator.base.neigh="$lan_if" 2>/dev/null
         echo "[INFO] 已初始化 accelerator.base (监听接口: $lan_if)"
     fi
-    if ! uci get accelerator.device >/dev/null 2>&1; then
-        uci set accelerator.device=hardware
+    if ! uci -q get accelerator.device >/dev/null 2>&1; then
+        uci set accelerator.device=hardware 2>/dev/null
         echo "[INFO] 已初始化 accelerator.device"
     fi
-    if ! uci get accelerator.@system[0] >/dev/null 2>&1; then
-        uci add accelerator system >/dev/null
+    if ! uci -q get accelerator.@system[0] >/dev/null 2>&1; then
+        uci add accelerator system >/dev/null 2>&1
         echo "[INFO] 已初始化 accelerator system section"
     fi
-    uci commit accelerator
+    uci commit accelerator 2>/dev/null
 }
 verify_luci() {
     local luci_src="/usr/lib/lua/luci"
@@ -2934,16 +3797,63 @@ verify_luci() {
     echo "  LuCI 完整性验证"
     echo "============================="
     echo ""
-    echo "[1/4] luci-compat 包"
-    if opkg list-installed 2>/dev/null | grep -q "^luci-compat"; then
-        echo "  [OK] luci-compat 已安装"
-    else
-        echo "  [WARN] luci-compat 未安装! LuCI Lua CBI 页面将无法渲染"
-        echo "  → 修复: opkg update && opkg install luci-compat"
+    echo "[1/5] LuCI Lua 兼容层"
+    for p in luci-compat luci-lua-runtime lua; do
+        if pkg_installed "$p"; then
+            echo "  [OK] $p 已安装"
+        else
+            echo "  [FAIL] $p 未安装"
+            errors=$((errors + 1))
+        fi
+    done
+    if [ ! -d /usr/lib/lua/luci/controller ]; then
+        echo "  [FAIL] /usr/lib/lua/luci/controller 不存在 (Lua 控制器不会被加载)"
         errors=$((errors + 1))
     fi
     echo ""
-    echo "[2/4] LuCI 文件完整性"
+    echo "[2/5] Lua 调度桥 / 菜单注册自检"
+    local luci_port=""
+    luci_port=$(uci -q get uhttpd.main.listen_http 2>/dev/null | sed -n '1s/.*[^0-9]\([0-9][0-9]*\)$/\1/p')
+    [ -z "$luci_port" ] && luci_port=$(uci -q get uhttpd.main.listen_https 2>/dev/null | sed -n '1s/.*[^0-9]\([0-9][0-9]*\)$/\1/p')
+    [ -z "$luci_port" ] && luci_port=80
+    local luci_code=""
+    for _scheme in http https; do
+        luci_code=$(curl -sk -o /dev/null -m 4 -w '%{http_code}' \
+            "$_scheme://127.0.0.1:${luci_port}/cgi-bin/luci/admin/services/acc/service" 2>/dev/null)
+        [ -n "$luci_code" ] && [ "$luci_code" != "000" ] && break
+    done
+    case "$luci_code" in
+        404)
+            echo "  [FAIL] 页面返回 404：Lua 控制器未被加载 (菜单未注册)"
+            echo "         修复: $(pkg_hint luci-compat luci-lua-runtime)"
+            echo "               rm -f /tmp/luci-indexcache* && /etc/init.d/rpcd restart && /etc/init.d/uhttpd restart"
+            errors=$((errors + 1))
+            ;;
+        200|301|302|401|403)
+            echo "  [OK] 页面已注册 (HTTP $luci_code，未登录返回鉴权码属正常)"
+            ;;
+        000|"")
+            echo "  [WARN] 无法从本机访问 LuCI (端口 $luci_port)，跳过页面探测"
+            ;;
+        *)
+            echo "  [INFO] 页面返回 HTTP $luci_code"
+            ;;
+    esac
+    for f in /usr/lib/lua/luci/ucodebridge.lua /usr/lib/lua/luci/cbi.lua /usr/lib/lua/luci/controller/acc.lua; do
+        if [ -f "$f" ]; then
+            echo "  [OK] $f"
+        else
+            echo "  [FAIL] 缺少 $f"
+            errors=$((errors + 1))
+        fi
+    done
+    if [ -f /usr/share/ucode/luci/dispatcher.uc ]; then
+        echo "  [OK] ucode 调度器存在 (dispatcher.uc)"
+    else
+        echo "  [INFO] 未找到 /usr/share/ucode/luci/dispatcher.uc (非 25.12 结构)"
+    fi
+    echo ""
+    echo "[3/5] LuCI 文件完整性"
     local required_files="
         controller/acc.lua
         model/cbi/leigod/service.lua
@@ -2972,7 +3882,7 @@ verify_luci() {
         echo "  →      然后运行 leigod-fw4.sh，脚本将自动写入内联补丁"
     fi
     echo ""
-    echo "[3/4] UCI 配置 (accelerator)"
+    echo "[4/5] UCI 配置 (accelerator)"
     if [ -f /etc/config/accelerator ]; then
         local uci_ok=0
         if uci get accelerator.base >/dev/null 2>&1; then
@@ -2999,14 +3909,16 @@ verify_luci() {
             errors=$((errors + 1))
         fi
         local dev_count
-        dev_count=$(uci show accelerator 2>/dev/null | grep -c "accelerator\.@device\[" 2>/dev/null || echo 0)
+        dev_count=$(uci show accelerator 2>/dev/null | grep -c "accelerator\.@device\[" 2>/dev/null)
+        [ -n "$dev_count" ] || dev_count=0
+        dev_count=$(printf '%s' "$dev_count" | head -1)
         echo "  [INFO] 设备条目数: $dev_count (0 = 首次安装/重装后正常)"
     else
         echo "  [FAIL] /etc/config/accelerator 文件不存在!"
         errors=$((errors + 1))
     fi
     echo ""
-    echo "[4/4] 自动暂停配置"
+    echo "[5/5] 自动暂停配置"
     if [ -f /etc/leigod-auto-pause.conf ]; then
         . /etc/leigod-auto-pause.conf
         if [ -n "$ACCOUNT_TOKEN" ]; then
@@ -3032,13 +3944,15 @@ verify_luci() {
         echo "  === 自动修复 ==="
         echo "  正在尝试自动修复..."
         local fixed=0
-        if ! opkg list-installed 2>/dev/null | grep -q "^luci-compat"; then
-            echo "  → 安装 luci-compat..."
-            opkg update >/dev/null 2>&1
-            opkg install luci-compat >/dev/null 2>&1 && \
-                { echo "  [OK] luci-compat 已安装"; fixed=$((fixed + 1)); } || \
-                echo "  [WARN] luci-compat 安装失败, 请手动安装"
-        fi
+        for p in luci-compat luci-lua-runtime; do
+            if ! pkg_installed "$p"; then
+                echo "  → 安装 $p ..."
+                pkg_update
+                pkg_install_raw "$p" >/dev/null 2>&1 && \
+                    { echo "  [OK] $p 已安装"; fixed=$((fixed + 1)); } || \
+                    echo "  [WARN] $p 安装失败, 请手动安装"
+            fi
+        done
         if [ -n "$missing" ]; then
             echo "  → 写入内联补丁..."
             apply_luci_fw4_patch
@@ -3055,8 +3969,10 @@ verify_luci() {
             fi
         fi
         ensure_uci_config
-        rm -rf /tmp/luci-*
-        echo "  → LuCI 缓存已清除"
+        rm -f /tmp/luci-indexcache* 2>/dev/null; rm -rf /tmp/luci-modulecache 2>/dev/null
+        /etc/init.d/rpcd restart >/dev/null 2>&1
+        /etc/init.d/uhttpd restart >/dev/null 2>&1
+        echo "  → LuCI 缓存已清除 (rpcd/uhttpd 已重启)"
         if [ "$fixed" -gt 0 ]; then
             echo ""
             echo "  已自动修复 $fixed 个问题，请刷新 Web 页面"
@@ -3079,8 +3995,147 @@ service() {
         echo "[INFO] LeigodAcc 服务已启用并启动"
     fi
 }
-fix_acc_core_conf() {
-    local conf="/tmp/acc/acc_core_conf.json"
+ACC_INI="/etc/config/acc_firewall.ini"
+ACC_CORE_JSON="/tmp/acc/acc_core_conf.json"
+acc_layout() {
+    if [ -f "$ACC_INI" ]; then
+        echo "new"
+    else
+        echo "legacy"
+    fi
+}
+acc_ini_get() {
+    [ -f "$ACC_INI" ] || return 1
+    sed -n "s/^$1=//p" "$ACC_INI" 2>/dev/null | head -1
+}
+acc_ini_set() {
+    local key="$1" val="$2"
+    [ -f "$ACC_INI" ] || return 1
+    if grep -q "^$key=" "$ACC_INI" 2>/dev/null; then
+        sed -i "s|^$key=.*|$key=$val|" "$ACC_INI"
+    else
+        printf '%s=%s\n' "$key" "$val" >> "$ACC_INI"
+    fi
+}
+acc_default_tproxy_ip() {
+    if [ "$1" = "nftables" ]; then
+        echo "0.0.0.0"
+    else
+        echo "10.20.30.40"
+    fi
+}
+acc_backend() {
+    local b
+    b=$(acc_ini_get backend 2>/dev/null)
+    if [ -n "$b" ]; then
+        echo "$b"
+    elif command -v iptables >/dev/null 2>&1; then
+        echo "iptables"
+    else
+        echo "nftables"
+    fi
+}
+port_listening() {
+    local hex _f
+    hex=$(printf '%04X' "$1" 2>/dev/null) || return 1
+    [ -n "$hex" ] || return 1
+    for _f in /proc/net/tcp /proc/net/tcp6; do
+        [ -r "$_f" ] || continue
+        if awk -v p=":$hex" '$4 == "0A" && substr($2, length($2) - length(p) + 1) == p { found = 1 } END { exit !found }' "$_f"; then
+            return 0
+        fi
+    done
+    return 1
+}
+restart_acc_service() {
+    [ -x /etc/init.d/acc ] || return 0
+    echo "[INFO] 重启 acc 服务以应用配置变更..."
+    /etc/init.d/acc restart >/dev/null 2>&1
+    sleep 5
+    if port_listening 5588; then
+        echo "[INFO] API 端口 5588 已监听，服务正常"
+        return 0
+    fi
+    echo "[WARN] API 端口 5588 未监听，web 子进程可能仍在重启 (查看 /tmp/acc/log/web_api.log)"
+    return 1
+}
+acc_web_crash_loop() {
+    local n
+    n=$(tail -60 /tmp/acc/log/acc_daemon.log 2>/dev/null | grep -c 'child process exit')
+    [ "${n:-0}" -ge 3 ]
+}
+acc_health_check() {
+    local i=0
+    while [ "$i" -lt 20 ]; do
+        if port_listening 5588; then
+            echo "[INFO] API 端口 5588 已监听 (TCP, 0.0.0.0)"
+            return 0
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+    echo "[ERROR] API 端口 5588 未监听 —— 手机 APP 将无法与 acc-gw 通信"
+    echo "        进程状态: $(ps ww 2>/dev/null | grep -c '[a]cc-gw') 个 acc-gw 进程"
+    if acc_web_crash_loop; then
+        echo "[ERROR] 检测到 web 子进程崩溃循环 (acc_daemon.log 持续出现 child process exit)"
+    fi
+    if grep -q 'start global config manager failed' /tmp/acc/log/web_api.log 2>/dev/null; then
+        echo "[ERROR] web 子进程报 'start global config manager failed'"
+        echo "        含义: 插件拉取雷神全局配置失败 (resources.leigodtech.com / opapi.xxghh.biz)"
+        echo "        常见原因: 双栈网络下 IPv6 不可达且客户端未回落 IPv4 / DNS 异常 / 上游接口故障"
+        echo "        现场验证: curl -4 -m5 -o /dev/null -w 'v4=%{http_code}\\n' https://opapi.xxghh.biz/common/comm/dict/getDictItems/LeigodBox_GlobalConfig/"
+        echo "                  curl -6 -m5 -o /dev/null -w 'v6=%{http_code}\\n' https://opapi.xxghh.biz/common/comm/dict/getDictItems/LeigodBox_GlobalConfig/"
+    else
+        echo "        排查: tail -30 /tmp/acc/log/web_api.log"
+    fi
+    echo "        重试: /etc/init.d/acc restart && sleep 8 && netstat -tlnp | grep 5588"
+    return 1
+}
+fix_acc_new_layout() {
+    local backend mode tproxy_ip want_ip json_ip changed=0
+    backend=$(acc_ini_get backend 2>/dev/null)
+    mode=$(acc_ini_get mode 2>/dev/null)
+    tproxy_ip=$(acc_ini_get tproxy_ip 2>/dev/null)
+    if [ -z "$backend" ]; then
+        backend=$(acc_backend)
+        acc_ini_set backend "$backend"
+        echo "[INFO] acc_firewall.ini 缺少 backend，已补为 $backend"
+        changed=1
+    fi
+    if [ -z "$mode" ]; then
+        mode="tproxy"
+        acc_ini_set mode "$mode"
+        echo "[INFO] acc_firewall.ini 缺少 mode，已补为 $mode"
+        changed=1
+    fi
+    want_ip=$(acc_default_tproxy_ip "$backend")
+    if [ -z "$tproxy_ip" ]; then
+        acc_ini_set tproxy_ip "$want_ip"
+        echo "[INFO] acc_firewall.ini 缺少 tproxy_ip，已按 backend=$backend 补为 $want_ip"
+        changed=1
+    elif [ "$tproxy_ip" != "$want_ip" ]; then
+        echo "[WARN] acc_firewall.ini tproxy_ip=$tproxy_ip 不是 $backend 后端标准值"
+        echo "[INFO] 已改为官方标准值 $want_ip (该字段是 TPROXY 转发目标，不是 LAN IP)"
+        acc_ini_set tproxy_ip "$want_ip"
+        changed=1
+    fi
+    if [ -f "$ACC_CORE_JSON" ]; then
+        tproxy_ip=$(acc_ini_get tproxy_ip 2>/dev/null)
+        json_ip=$(sed -n 's/.*"tproxy_ip":"\([^"]*\)".*/\1/p' "$ACC_CORE_JSON" 2>/dev/null | head -1)
+        if [ -n "$tproxy_ip" ] && [ -n "$json_ip" ] && [ "$json_ip" != "$tproxy_ip" ]; then
+            sed -i "s|\"tproxy_ip\":\"[^\"]*\"|\"tproxy_ip\":\"$tproxy_ip\"|" "$ACC_CORE_JSON" 2>/dev/null
+            echo "[INFO] acc_core_conf.json tproxy_ip 已对齐 INI: $json_ip -> $tproxy_ip"
+        fi
+    fi
+    if [ "$changed" = "1" ]; then
+        restart_acc_service
+    else
+        echo "[INFO] 加速配置正常 (backend=$backend, mode=$mode, tproxy_ip=$(acc_ini_get tproxy_ip 2>/dev/null))"
+    fi
+    return 0
+}
+fix_acc_legacy_layout() {
+    local conf="$ACC_CORE_JSON"
     [ ! -f "$conf" ] && return 0
     lan_ip=$(uci get network.lan.ipaddr 2>/dev/null)
     [ -z "$lan_ip" ] && return 0
@@ -3102,8 +4157,7 @@ fix_acc_core_conf() {
     current_mode=$(sed -n 's/.*"acc_mode":\([0-9]*\).*/\1/p' "$conf" 2>/dev/null)
     local fixed=0
     if [ "$current_ip" != "$lan_ip" ]; then
-        echo "[WARN] acc_core_conf.json tproxy_ip 不正确: '$current_ip' (应为 '$lan_ip')"
-        echo "[INFO] 正在修复 acc_core_conf.json tproxy_ip..."
+        echo "[WARN] acc_core_conf.json tproxy_ip 不正确: '$current_ip' (应为 LAN IP '$lan_ip')"
         sed -i "s|\"tproxy_ip\":\"[^\"]*\"|\"tproxy_ip\":\"$lan_ip\"|" "$conf"
         fixed=1
         echo "[INFO] acc_core_conf.json tproxy_ip 已修复为 $lan_ip"
@@ -3116,7 +4170,6 @@ fix_acc_core_conf() {
     fi
     if [ "$current_mode" != "2" ]; then
         echo "[WARN] acc_core_conf.json acc_mode=$current_mode 不稳定 (已知稳定值为 2)"
-        echo "[INFO] 正在修正 acc_mode 为 2 (TPROXY, 唯一稳定值)..."
         if [ -z "$current_mode" ]; then
             sed -i 's|"acc_mode":[0-9]*|"acc_mode":2|' "$conf"
         else
@@ -3124,28 +4177,18 @@ fix_acc_core_conf() {
         fi
         fixed=1
         echo "[INFO] acc_core_conf.json acc_mode 已修正为 2"
-        echo "[INFO] (daemon 日志中的 'unknow acc mode:2' 为冗余警告, 不影响功能)"
     fi
-    if [ -f /etc/init.d/acc ]; then
-        if grep -qE -- "-m tun\b" /etc/init.d/acc 2>/dev/null; then
-            echo "[INFO] 同步修复 /etc/init.d/acc 模式为 tproxy..."
-            sed -i 's|-m tun|-m tproxy|' /etc/init.d/acc
-            fixed=1
-        fi
+    if [ -f /etc/init.d/acc ] && grep -qE -- "-m tun\b" /etc/init.d/acc 2>/dev/null; then
+        echo "[INFO] 同步修复 /etc/init.d/acc 模式为 tproxy..."
+        sed -i 's|-m tun|-m tproxy|' /etc/init.d/acc
+        fixed=1
     fi
     if [ "$fixed" = "1" ] && [ -x /etc/init.d/acc ]; then
         if ! pgrep -f "/usr/sbin/leigod/acc-gw" >/dev/null 2>&1; then
             echo "[INFO] acc-gw 未运行, 启动服务..."
             /etc/init.d/acc start >/dev/null 2>&1
             sleep 4
-            recheck_ip=$(sed -n 's/.*"tproxy_ip":"\([^"]*\)".*/\1/p' "$conf" 2>/dev/null)
-            if [ "$recheck_ip" != "$lan_ip" ]; then
-                echo "[WARN] tproxy_ip 在启动后又被覆盖为 '$recheck_ip'"
-                echo "[INFO] 二进制硬编码了假IP, 再次修复..."
-                sed -i "s|\"tproxy_ip\":\"[^\"]*\"|\"tproxy_ip\":\"$lan_ip\"|" "$conf"
-            fi
-            sleep 2
-            if netstat -tlnp 2>/dev/null | grep -q 5588 || ss -tlnp 2>/dev/null | grep -q 5588; then
+            if port_listening 5588; then
                 echo "[INFO] 端口 5588 已监听, 服务正常"
             else
                 echo "[ERR] 端口 5588 未监听! 请手动排查: /etc/init.d/acc restart"
@@ -3154,6 +4197,12 @@ fix_acc_core_conf() {
             echo "[INFO] acc-gw 运行中, JSON 配置已修复 (无需重启以免中断加速)"
         fi
     fi
+}
+fix_acc_core_conf() {
+    case "$(acc_layout)" in
+        new)    fix_acc_new_layout ;;
+        legacy) fix_acc_legacy_layout ;;
+    esac
 }
 install_tproxy_watcher() {
     local watcher_cron="*/5 * * * * /usr/sbin/leigod/leigod-fw4.sh fix-tproxy >/dev/null 2>&1"
@@ -3168,7 +4217,7 @@ install_tproxy_watcher() {
     fi
     echo "$watcher_cron" >> "$cron_file"
     /etc/init.d/cron restart 2>/dev/null
-    echo "[INFO] tproxy_ip 守护 cron 已安装 (每5分钟检查)"
+    echo "[INFO] 加速配置守护 cron 已安装 (每5分钟检查 INI/JSON 一致性)"
 }
 remove_tproxy_watcher() {
     sed -i '/leigod-fw4.sh fix-tproxy/d' /etc/crontabs/root 2>/dev/null
@@ -3180,7 +4229,38 @@ switch_mode() {
     fi
     echo "当前版本可能不支持切换模式"
     echo
-    if opkg list-installed | grep -q "^leigod-acc"; then
+    if [ "$(acc_layout)" = "new" ]; then
+        local cur new_mode
+        cur=$(acc_ini_get mode 2>/dev/null)
+        if [ "$cur" = "tun" ]; then
+            new_mode="tproxy"
+        else
+            new_mode="tun"
+        fi
+        acc_ini_set mode "$new_mode"
+        echo "[INFO] acc_firewall.ini mode: ${cur:-未设置} -> $new_mode"
+        local backend want_ip cur_ip
+        backend=$(acc_backend)
+        want_ip=$(acc_default_tproxy_ip "$backend")
+        cur_ip=$(acc_ini_get tproxy_ip 2>/dev/null)
+        if [ "$cur_ip" != "$want_ip" ]; then
+            acc_ini_set tproxy_ip "$want_ip"
+            echo "[INFO] tproxy_ip 已按 backend=$backend 校正为 $want_ip"
+        fi
+        if [ "$new_mode" = "tun" ]; then
+            echo "[WARN] 新版引擎以 TPROXY 为主；TUN 模式可能与 fw4 规则/APP 行为不同，请实测"
+        fi
+        /etc/init.d/acc restart >/dev/null 2>&1
+        sleep 5
+        if port_listening 5588; then
+            echo "[INFO] 已切换并重启，API 端口 5588 正常监听"
+        else
+            echo "[WARN] 已切换并重启，但 5588 未监听 (查看 /tmp/acc/log/web_api.log)"
+        fi
+        install_tproxy_watcher
+        return 0
+    fi
+    if pkg_installed "leigod-acc"; then
         current_tun=$(uci -q get accelerator.@system[-1].tun 2>/dev/null)
         if [ "$current_tun" = "1" ]; then
             uci set accelerator.@system[-1].tun='0'
@@ -3220,14 +4300,13 @@ switch_mode() {
         fi
     fi
     if [ "$FW_TYPE" = "fw4" ]; then
-        echo "[INFO] fw4/nftables 环境 — 确保 acc_core_conf.json tproxy_ip 正确"
-        echo "[INFO] 已安装的二进制版本可能不支持 TUN 模式，TPROXY + 正确 LAN IP 是推荐方案"
+        echo "[INFO] fw4/nftables 环境 — 旧版引擎建议保持 TPROXY"
     fi
     /etc/init.d/acc stop
     /etc/init.d/acc start
     echo "[INFO] 已经重启 LeigodAcc 服务"
     sleep 3
-    if [ -f /tmp/acc/acc_core_conf.json ]; then
+    if [ -f "$ACC_CORE_JSON" ]; then
         fix_acc_core_conf
     fi
     install_tproxy_watcher
@@ -3257,8 +4336,21 @@ disabled_ipv6() {
     /etc/init.d/odhcpd restart
 }
 install_lean_ipkg_version() {
-    if opkg list-installed | grep -q "leigod-acc"; then
-        echo "[INFO] leigod-acc 已安装，L 有大雕"
+    if [ "$PKG_MGR" = "apk" ]; then
+        echo ""
+        echo "=========================================="
+        echo "  [不支持] Lean IPKG 版"
+        echo "=========================================="
+        echo "  当前系统使用 apk 包管理器 (OpenWrt 25.12+ / iStoreOS 25.12)。"
+        echo "  Lean 版插件仅提供 .ipk 格式，apk 无法安装 .ipk 包。"
+        echo ""
+        echo "  请改用菜单选项 1 (官方安装脚本)，功能一致且已做 fw4 适配。"
+        echo "=========================================="
+        echo ""
+        return 1
+    fi
+    if pkg_installed "leigod-acc"; then
+        echo "[INFO] leigod-acc 已安装"
         return
     else
         echo "[INFO] leigod-acc 未安装"
@@ -3270,7 +4362,7 @@ install_lean_ipkg_version() {
             rm -f /var/lock/opkg.lock
         fi
         if ! check_network; then
-            echo "[WARN] 网络不可达，后续 opkg update 及下载可能会失败"
+            echo "[WARN] 网络不可达，后续依赖安装及下载可能会失败"
             echo -n "是否继续? (y/n): "
             read proceed
             [ "$proceed" != "y" ] && [ "$proceed" != "Y" ] && return
@@ -3294,15 +4386,15 @@ install_lean_ipkg_version() {
     else
         echo "[INFO] 无法获取最新版本 (GitHub API 可能限流或网络不可达)，使用默认版本: $LEIGOD_RELEASE"
     fi
-    required_packages="libpcap $PKG_IPTABLES $PKG_NAT $PKG_TPROXY"
+    required_packages="$PKG_LIBPCAP $PKG_IPTABLES $PKG_NAT $PKG_TPROXY"
     [ -n "$PKG_IPT_TPROXY_MOD" ] && required_packages="$required_packages $PKG_IPT_TPROXY_MOD"
     [ -n "$PKG_IPSET" ] && required_packages="$required_packages $PKG_IPSET"
     [ -n "$PKG_IPSET_TOOL" ] && required_packages="$required_packages $PKG_IPSET_TOOL"
-    required_packages="$required_packages kmod-tun curl miniupnpd tc-full kmod-netem conntrack conntrackd"
+    required_packages="$required_packages kmod-tun curl $PKG_UPNP tc-full kmod-netem conntrack conntrackd"
     missing_packages=""
     echo "[INFO] 检查在线软件源中是否存在所有依赖包..."
     for package in $required_packages; do
-        if ! opkg list | grep -q "^$package"; then
+        if ! pkg_available "$package"; then
             echo "[ERROR] 在线软件源中缺少依赖包: $package"
             missing_packages="$missing_packages $package"
         fi
@@ -3317,14 +4409,14 @@ install_lean_ipkg_version() {
         return 1
     fi
     echo "[INFO] 所有依赖包已在在线软件源中找到，正在安装缺失的依赖包..."
-    OPKG_FAILED=""
+    PKG_FAILED=""
     for package in $required_packages; do
-        if ! opkg list-installed | grep -q "^$package"; then
-            safe_opkg_install "$package"
+        if ! pkg_installed "$package"; then
+            safe_pkg_install "$package"
         fi
     done
-    if [ -n "$OPKG_FAILED" ]; then
-        echo "[ERROR] 以下依赖包安装失败:$OPKG_FAILED"
+    if [ -n "$PKG_FAILED" ]; then
+        echo "[ERROR] 以下依赖包安装失败:$PKG_FAILED"
         echo "[ERROR] 请检查网络连接和软件源配置后重试"
         return 1
     fi
@@ -3334,10 +4426,10 @@ install_lean_ipkg_version() {
     fi
     setup_fw4_integration
     apply_luci_fw4_patch
-    arch=$(opkg print-architecture | grep "arch" | awk '{print $2}' | grep -vE "all|noarch" | head -1)
-    if opkg list | grep -q "leigod-acc"; then
+    arch=$(pkg_arch)
+    if pkg_available "leigod-acc"; then
         echo "[INFO] 软件源中检测到 leigod-acc 插件，正在安装..."
-        safe_opkg_install leigod-acc luci-app-leigod-acc luci-i18n-leigod-acc-zh-cn
+        safe_pkg_install leigod-acc luci-app-leigod-acc luci-i18n-leigod-acc-zh-cn
         echo "[INFO] Lean 版本 leigod-acc 安装成功！"
     else
         echo "[INFO] 在线软件源中没有找到 leigod-acc 包，将从 GitHub Releases 下载"
@@ -3401,8 +4493,8 @@ install_lean_ipkg_version() {
             echo ""
         fi
     fi
-    if ! opkg list-installed | grep -q 'luci-app-upnp'; then
-        safe_opkg_install luci-app-upnp
+    if ! pkg_installed "$PKG_LUCI_UPNP"; then
+        safe_pkg_install "$PKG_LUCI_UPNP"
     fi
     if [ -f /etc/config/upnpd ]; then
         echo "[INFO] 正在启用 UPnP..."
@@ -3446,13 +4538,14 @@ install_lean_ipkg_version() {
     fi
 }
 check_logs() {
-    if ! opkg list-installed | grep -q "^tc-full"; then
+    if ! pkg_installed "tc-full"; then
         return 0
     fi
     if grep -q "exec tc command failed" /tmp/acc/acc-gw.log-* 2>/dev/null && grep -q "No such file or directory" /tmp/acc/acc-gw.log-* 2>/dev/null; then
         echo "[ERROR] 检测到插件中的 tc-full 组件出现了 'exec tc command failed' 错误，可能是软件源或者固件提供的 tc-full 组件问题"
         echo "可能导致无法加速的问题，由于实装 tc-full 的用户过少，请自行测试加速问题或手动重装 tc-full 组件"
-        echo "opkg update && opkg remove tc-full && opkg install tc-full"
+        echo "# apk 系统: apk fix tc-full 或 apk add --force-overwrite tc-full"
+        echo "# opkg 系统: opkg update && opkg remove tc-full && opkg install tc-full"
         echo
         sleep 5
     fi
@@ -3565,27 +4658,37 @@ check_service_status() {
     fi
     echo -n "加速模式: "
     if [ -d /usr/sbin/leigod ]; then
-        if grep -qE -- "-m tun\b" /etc/init.d/acc 2>/dev/null; then
+        if [ "$(acc_layout)" = "new" ]; then
+            echo "$(acc_ini_get mode 2>/dev/null) (acc_firewall.ini)"
+        elif grep -qE -- "-m tun\b" /etc/init.d/acc 2>/dev/null; then
             echo "TUN"
         elif grep -qE -- "-m tproxy\b" /etc/init.d/acc 2>/dev/null; then
             echo "TPROXY"
-        elif grep -q -- "--mode tun" /etc/init.d/acc 2>/dev/null; then
-            echo "TUN (旧格式, 可能未生效)"
-        elif grep -q -- "--mode tproxy" /etc/init.d/acc 2>/dev/null; then
-            echo "TPROXY (旧格式, 可能未生效)"
+        elif grep -q -- '${mode}' /etc/init.d/acc 2>/dev/null; then
+            echo "$(acc_ini_get mode 2>/dev/null) (init 模板 \${mode})"
         else
-            echo "未知 (检查 /etc/init.d/acc)"
+            echo "未知 (检查 /etc/init.d/acc 或 acc_firewall.ini)"
         fi
     else
         echo "N/A"
     fi
+    if [ "$(acc_layout)" = "new" ]; then
+        echo "防火墙后端: $(acc_backend) / tproxy_ip: $(acc_ini_get tproxy_ip 2>/dev/null)"
+    fi
     if pgrep -f "/usr/sbin/leigod/acc-gw" >/dev/null 2>&1; then
         acc_pid=$(pgrep -f "/usr/sbin/leigod/acc-gw" | head -1)
         echo "acc-gw 进程: 运行中 (PID: $acc_pid)"
-        if ss -tlnp 2>/dev/null | grep -q ":5588.*acc-gw" || netstat -tlnp 2>/dev/null | grep -q ":5588.*acc-gw"; then
+        if port_listening 5588; then
             echo "API 端口: TCP 5588 监听中"
         else
             echo "API 端口: TCP 5588 未监听! (手机APP将无法通信)"
+            if acc_web_crash_loop; then
+                echo "  → 检测到 web 子进程崩溃循环 (acc_daemon.log 反复 child process exit)"
+                if grep -q 'start global config manager failed' /tmp/acc/log/web_api.log 2>/dev/null; then
+                    echo "  → 原因线索: 拉取雷神全局配置失败 (resources.leigodtech.com / opapi.xxghh.biz)"
+                    echo "  → 可尝试: /etc/init.d/acc restart (若为瞬时网络故障)"
+                fi
+            fi
         fi
     else
         echo "acc-gw 进程: 未运行"
@@ -3650,13 +4753,24 @@ check_service_status() {
         conf_tproxy_ip=$(sed -n 's/.*"tproxy_ip":"\([^"]*\)".*/\1/p' "$acc_conf" 2>/dev/null)
         conf_acc_mode=$(sed -n 's/.*"acc_mode":\([0-9]*\).*/\1/p' "$acc_conf" 2>/dev/null)
         lan_ip=$(uci get network.lan.ipaddr 2>/dev/null)
-        if [ "$conf_tproxy_ip" != "$lan_ip" ] && [ -n "$lan_ip" ]; then
-            echo "⚠ acc_core_conf.json tproxy_ip 异常: '$conf_tproxy_ip' (应为 '$lan_ip')"
-            echo "  这会导致 Web 子进程崩溃、加速几秒后断开!"
+        if [ "$(acc_layout)" = "new" ]; then
+            ini_ip=$(acc_ini_get tproxy_ip 2>/dev/null)
+            want_ip=$(acc_default_tproxy_ip "$(acc_backend)")
+            if [ "$conf_tproxy_ip" != "$ini_ip" ]; then
+                echo "⚠ acc_core_conf.json tproxy_ip=$conf_tproxy_ip 与 INI($ini_ip) 不一致"
+                echo "  正在对齐..."
+                fix_acc_core_conf
+            else
+                echo "acc_core_conf.json: 正常 (tproxy_ip=$conf_tproxy_ip, acc_mode=$conf_acc_mode)"
+                echo "acc_firewall.ini: backend=$(acc_backend), mode=$(acc_ini_get mode 2>/dev/null), tproxy_ip=$ini_ip (标准值 $want_ip)"
+            fi
+        elif [ "$conf_tproxy_ip" != "$lan_ip" ] && [ -n "$lan_ip" ]; then
+            echo "⚠ acc_core_conf.json tproxy_ip 异常: '$conf_tproxy_ip' (应为 LAN IP '$lan_ip')"
+            echo "  旧版引擎会导致 Web 子进程崩溃、加速几秒后断开!"
             echo "  正在自动修复..."
             fix_acc_core_conf
         elif [ "$conf_acc_mode" = "1" ]; then
-            echo "⚠ acc_core_conf.json acc_mode=1 (TUN) — 此二进制版本仅支持 TPROXY"
+            echo "⚠ acc_core_conf.json acc_mode=1 (TUN) — 旧版二进制仅支持 TPROXY"
             echo "  正在自动修复..."
             fix_acc_core_conf
         else
@@ -3716,7 +4830,7 @@ diagnose_latency() {
             echo "  → PPPoE 隧道口无 qdisc。注意: 不要在 pppoe 虚拟接口上加 qdisc"
             echo "  → 物理网卡 (eth0) 的 fq_codel 已覆盖出口流量"
             echo "  → 如延迟仍波动, 安装 SQM 对 PPPoE 做端到端整形:"
-            echo "    opkg update && opkg install sqm-scripts luci-app-sqm"
+            echo "    $(pkg_hint sqm-scripts luci-app-sqm)"
         else
             echo "  → 请安装 SQM 或手动添加队列规则"
             echo -n "  是否立即添加 fq_codel? (y/n): "
@@ -3737,12 +4851,12 @@ diagnose_latency() {
     elif [ "$has_fq_codel" = "1" ]; then
         echo "  [WARN] 仅 fq_codel (基础防抖动, 建议升级到 SQM)"
         echo "  → fq_codel 只控制出站队列, 入站流量无法管理"
-        echo "  → 建议: opkg update && opkg install sqm-scripts luci-app-sqm"
+        echo "  → 建议: $(pkg_hint sqm-scripts luci-app-sqm)"
         echo "  → 安装后在 LuCI → 网络 → SQM QoS 中配置 $wan_if 接口"
         issues=$((issues + 1))
     else
         echo "  [FAIL] 无队列管理! 延迟波动的主要根因"
-        echo "  → 请立即安装: opkg update && opkg install sqm-scripts luci-app-sqm"
+        echo "  → 请立即安装: $(pkg_hint sqm-scripts luci-app-sqm)"
         issues=$((issues + 1))
     fi
     echo
@@ -3902,9 +5016,9 @@ install_sqm() {
         sed -i "/tc qdisc.*$wan_if.*fq_codel/d" /etc/rc.local 2>/dev/null
     fi
     echo "[INFO] 尝试安装 SQM 包..."
-    opkg update >/dev/null 2>&1
+    pkg_update
     local pkg_ok=0
-    if opkg install sqm-scripts luci-app-sqm 2>/dev/null; then
+    if pkg_install_raw sqm-scripts luci-app-sqm >/dev/null 2>&1; then
         pkg_ok=1
         local linklayer="ethernet"
         local overhead=44
@@ -4340,9 +5454,9 @@ help() {
     echo "3. 重装：重装 LeigodAcc"
     echo "4. 禁用/启用：禁用或启用 LeigodAcc 服务"
     echo "5. 切换运行模式：在 TUN 和 Tproxy 模式之间切换"
-    echo "6. 安装兼容性依赖：尝试使用天灵 immortalwrt pku 源安装常见缺失依赖"
+    echo "6. 安装兼容性依赖：从当前固件软件源补全常见缺失依赖"
     echo "7. 禁用 IPv6: 可以使手机部分手机游戏也能正常加速，会禁用掉 IPv6 网络"
-    echo "8. 切换为 Lean IPKG 版：可以通过 opkg 安装 leigod-acc 插件，为实验性版本"
+    echo "8. 切换为 Lean IPKG 版：仅 opkg 系统可用，25.12/apk 不支持 .ipk"
     echo "9. 自动暂停时长：检测到游戏结束自动暂停计费，省时长"
     echo "S. 查看服务状态：显示安装、运行、设备、日志等诊断信息"
     echo "L. 延迟波动诊断：检查 bufferbloat/QoS/GAMEACC 流量等延迟波动根因，可安装 SQM"
@@ -4359,9 +5473,20 @@ help() {
         echo "  使用传统 fw3/iptables 模式"
     fi
     echo ""
+    echo "包管理器："
+    echo "  当前: $(pkg_mgr_name)"
+    if [ "$PKG_MGR" = "apk" ]; then
+        echo "  安装: apk add <包名>    卸载: apk del <包名>"
+        echo "  已装: apk info          刷源: apk update"
+        echo "  LuCI 依赖: luci-compat + luci-lua-runtime (缺失则菜单不出现)"
+    else
+        echo "  安装: opkg install <包名>  卸载: opkg remove <包名>"
+    fi
+    echo ""
     sleep 3
 }
 if [ "$1" = "fix-tproxy" ]; then
+    detect_pkg_mgr
     detect_firewall
     set_fw_packages
     if [ -f /tmp/acc/acc_core_conf.json ]; then
@@ -4370,12 +5495,14 @@ if [ "$1" = "fix-tproxy" ]; then
     exit 0
 fi
 if [ "$1" = "tune-network" ]; then
+    detect_pkg_mgr
     detect_firewall
     set_fw_packages
     apply_network_tuning
     exit 0
 fi
 if [ "$1" = "diagnose" ]; then
+    detect_pkg_mgr
     detect_firewall
     set_fw_packages
     echo "============================="
@@ -4390,6 +5517,12 @@ if [ "$1" = "diagnose" ]; then
     echo "  固件: $(grep DISTRIB_DESCRIPTION /etc/openwrt_release 2>/dev/null | cut -d"'" -f2)"
     echo "  内核: $(uname -r)"
     echo "  防火墙: $FW_NAME"
+    echo "  包管理: $(pkg_mgr_name)"
+    if pkg_installed luci-compat && pkg_installed luci-lua-runtime; then
+        echo "  LuCI: Lua 兼容层已安装"
+    else
+        echo "  LuCI: Lua 兼容层缺失! 执行: $(pkg_hint luci-compat luci-lua-runtime)"
+    fi
     echo ""
     echo "--- 进程 ---"
     if ps | grep -q "[a]cc-gw"; then
@@ -4446,12 +5579,52 @@ if [ "$1" = "diagnose" ]; then
     echo "============================="
     exit 0
 fi
+if [ "$1" = "disable-upgrade" ]; then
+    acc_upgrade_disable
+    exit $?
+fi
+if [ "$1" = "enable-upgrade" ]; then
+    acc_upgrade_enable
+    exit $?
+fi
+if [ "$1" = "dns-guard" ]; then
+    dns_guard_apply
+    exit 0
+fi
+if [ "$1" = "apply-luci" ]; then
+    detect_pkg_mgr
+    detect_firewall
+    set_fw_packages
+    ensure_uci_config
+    apply_luci_fw4_patch
+    rm -f /tmp/luci-indexcache* 2>/dev/null; rm -rf /tmp/luci-modulecache 2>/dev/null
+    /etc/init.d/rpcd restart >/dev/null 2>&1
+    /etc/init.d/uhttpd restart >/dev/null 2>&1
+    echo "[INFO] LuCI 文件已重新部署，请刷新 Web 后台 (服务 → 雷神加速器)"
+    exit 0
+fi
 if [ "$1" = "verify-luci" ]; then
+    detect_pkg_mgr
     detect_firewall
     set_fw_packages
     verify_luci
     exit 0
 fi
+if [ "$1" = "env" ]; then
+    detect_pkg_mgr
+    detect_firewall
+    set_fw_packages
+    echo "固件:   $(grep DISTRIB_DESCRIPTION /etc/openwrt_release 2>/dev/null | cut -d"'" -f2)"
+    echo "内核:   $(uname -r)"
+    echo "架构:   $(uname -m) / $(pkg_arch)"
+    echo "防火墙: $FW_NAME"
+    echo "包管理: $(pkg_mgr_name)"
+    echo "LuCI:   lua=$(pkg_installed lua && echo yes || echo no) compat=$(pkg_installed luci-compat && echo yes || echo no) lua-runtime=$(pkg_installed luci-lua-runtime && echo yes || echo no)"
+    echo "TPROXY: $(lsmod 2>/dev/null | grep -q nft_tproxy && echo loaded || echo not-loaded)"
+    echo "LAN:    $(uci get network.lan.ipaddr 2>/dev/null)"
+    exit 0
+fi
+detect_pkg_mgr
 detect_firewall
 set_fw_packages
 check_openclash_mode
@@ -4501,6 +5674,12 @@ while true; do
             ;;
         [tT])
             apply_network_tuning
+            ;;
+        [dD])
+            dns_guard_menu
+            ;;
+        [uU])
+            acc_upgrade_menu
             ;;
         [hH])
             help

@@ -25,16 +25,18 @@
   <p>
     插件运行需要借助一些依赖才能运行, 一般第三方固件默认已经集成了大部分的依赖, <br>
     如果使用的是openwrt官方的固件, 则需要确保依赖安装好了, 以下列出依赖包和注意事项 <br>
-    libpcap <br>
-    iptables <br>
-    kmod-ipt-nat <br>
-    iptables-mod-tproxy <br>
-    kmod-ipt-tproxy <br>
+    <b>OpenWrt 25.12 / iStoreOS 25.12 (apk)</b>: libpcap1, iptables-nft, kmod-nft-nat, kmod-nft-tproxy, kmod-tun, tc-full, ipset <br>
+    <b>OpenWrt 24.10 及更早 (opkg)</b>: libpcap, iptables, kmod-ipt-nat, iptables-mod-tproxy, kmod-ipt-tproxy, kmod-ipt-ipset, ipset <br>
     kmod-netem(非必须, 针对于一些icmp测速的游戏使用, 只影响界面显示, 实际游戏效果不影响) <br>
     tc-full(非必须, 同kmod-netem) <br>
-    kmod-ipt-ipset <br>
-    ipset <br>
     curl(谨慎更新, 某些三方固件升级curl, 会导致curl出现问题) <br>
+  </p>
+  <legend>LuCI 兼容层 (重要)</legend>
+  <p>
+    OpenWrt 25.12 起 LuCI 调度器改为 ucode, 本插件的网页界面为 Lua CBI, <br>
+    必须安装 luci-compat 与 luci-lua-runtime 才能被加载, 缺失时菜单不会出现, <br>
+    访问地址会提示 404 "No page is registered at ..." <br>
+    安装命令: apk add luci-compat luci-lua-runtime <br>
   </p>
   <legend>网桥模式</legend>
   <p>

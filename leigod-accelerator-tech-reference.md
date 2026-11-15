@@ -4,6 +4,7 @@
 > **源码仓库**: [miaoermua/openwrt-leigodacc-manager](https://github.com/miaoermua/openwrt-leigodacc-manager)
 > **当前适配版本**: v2.3.3 (2026-05-31)
 > **实测固件**: ImmortalWrt 24.10 / 路由器: Xiaomi Redmi Router AX6000
+> **当前适配目标**: iStoreOS 25.12.5（OpenWrt 25.12 / apk）/ x86_64
 
 ---
 
